@@ -21,6 +21,7 @@ et le lui communique via `chat_template_kwargs.reasoning_effort`.
 | `POST */chat/completions` **sans** `reasoning_effort` | Envoie les derniers tours de conversation au sidecar (LLM) avec `enable_thinking: false` (voir ci-dessous), reçoit `low`/`medium`/`xhigh`, **injecte** `chat_template_kwargs.reasoning_effort` puis transfère |
 | `reasoning_effort` déjà présent (dans `chat_template_kwargs` **ou** au top-level — c'est ce qu'envoie Open WebUI quand l'utilisateur remplit le champ *Advanced options*) | **Transfert byte-par-byte, sidecar non consulté** |
 | `chat_template_kwargs` contient `"enable_thinking": false` | L'effort est sans objet : le prompt est transféré **tel quel** au LLM principal, sidecar non consulté, aucune injection |
+| Réponse **streaming** (les cas ci-dessus + effort fourni par le client) | Le flux SSE est préfixé par des chunks `delta.reasoning` : « Détermination de l'effort de raisonnement… » puis « Effort: {effort} » (ou un simple écho « Effort: {effort} » quand le client a fourni sa valeur). Open WebUI les affiche dans la **boîte de réflexion** repliable, sans polluer le message ni l'historique. Désactivable via `EFFORT_NOTIFY=0` |
 | Sidecar HS / timeout | Repli sur `DEFAULT_REASONING_EFFORT` (si défini), sinon transfert tel quel |
 | `GET /v1/models` et `GET /models` (listes de modèles) | Chaque modèle est renvoyé avec `"loaded": true` et `"status": {"value": "loaded"}` (sauf si le backend fournit déjà un statut) → **point vert « chargé »** dans la liste des modèles OWUI (voir ci-dessous) |
 | `/v1/models`, `/v1/completions`, audio, tools, SSE… | Transfert **100 % transparent** (body, headers, status, streaming SSE byte-par-byte) |
@@ -45,6 +46,7 @@ manquait.
 | `DEFAULT_REASONING_EFFORT` | *(vide)* | Repli si sidecar HS / absent (vide = transfert tel quel) |
 | `CONTEXT_TURNS` | `2` | Nb de tours de fin de conversation envoyés au sidecar |
 | `MAX_PROMPT_CHARS` | `6000` | Budget de caractères envoyé au sidecar (le dernier message user est prioritaire) |
+| `EFFORT_NOTIFY` | `1` | Annoncer l'effort en streaming (`delta.reasoning`). `0` = désactiver l'annonce |
 | `LOG_LEVEL` | `INFO` | `DEBUG` pour voir les flux complets |
 
 ## Démarrage

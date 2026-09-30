@@ -72,6 +72,26 @@ def sse_chunks(resp: httpx.Response) -> list[str]:
     return out, resp.text
 
 
+def sse_reasoning(text: str) -> list[str]:
+    """Collect every delta.reasoning value from an SSE stream body."""
+    out = []
+    for line in text.splitlines():
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:]
+        if payload.strip() == "[DONE]":
+            continue
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        for ch in data.get("choices") or []:
+            r = (ch.get("delta") or {}).get("reasoning")
+            if isinstance(r, str):
+                out.append(r)
+    return out
+
+
 def main() -> int:
     print("== starting mocks + proxy ==")
     start("sidecar", "mock_sidecar.py", {"PORT": str(SIDECAR_PORT), "SIDECAR_ANSWER": "xhigh"}, SIDECAR_PORT)
@@ -102,6 +122,13 @@ def main() -> int:
     check("T1 status 200", r.status_code == 200, str(r.status_code))
     check("T1 SSE contains [DONE]", "data: [DONE]" in text)
     check("T1 stream contains model echo", "hello" in text)
+    # effort notification: announced in delta.reasoning before the backend chunks
+    reasoning = "".join(sse_reasoning(text))
+    check(
+        "T1 effort announced in reasoning",
+        "D\u00e9termination de l\u2019effort" in reasoning and "Effort: xhigh" in reasoning,
+        reasoning[:200],
+    )
 
     sidecar_calls = client.get(f"http://127.0.0.1:{SIDECAR_PORT}/calls").json()
     check("T1 sidecar consulted once", sidecar_calls["count"] == 1, str(sidecar_calls["count"]))
@@ -194,6 +221,17 @@ def main() -> int:
     check("T6 status 200", r.status_code == 200)
     after = client.get(f"http://127.0.0.1:{SIDECAR_PORT}/calls").json()["count"]
     check("T6 sidecar NOT consulted", before == after, f"{before} -> {after}")
+    # client-provided effort is echoed in the reasoning box
+    r6 = client.post(
+        f"{BASE}/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True, "reasoning_effort": "high"},
+    )
+    check("T6 echo status 200", r6.status_code == 200)
+    check(
+        "T6 client effort echoed in reasoning",
+        "Effort: high" in "".join(sse_reasoning(r6.text)),
+        "".join(sse_reasoning(r6.text))[:200],
+    )
     received = client.get(f"http://127.0.0.1:{BACKEND_PORT}/received").json()["bodies"]
     check("T6 effort forwarded", received[-1].get("reasoning_effort") == "high")
 
@@ -224,6 +262,21 @@ def main() -> int:
         json.dumps(last.get("chat_template_kwargs")),
     )
     check("T7 prompt untouched", last["messages"][0]["content"] == "a hard math proof question")
+    # enable_thinking=false: no effort notification at all
+    r7s = client.post(
+        f"{BASE}/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "a hard math proof question"}],
+            "stream": True,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+    check("T7s stream 200", r7s.status_code == 200)
+    check(
+        "T7s no reasoning announcement (thinking disabled)",
+        sse_reasoning(r7s.text) == [],
+        str(sse_reasoning(r7s.text)),
+    )
 
     # ---- T8: GET /models -> models reported as loaded (OWUI green dot) ----
     print("\n== T8: GET /models management list -> status loaded injected ==")

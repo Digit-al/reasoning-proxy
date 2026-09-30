@@ -24,6 +24,13 @@ Behaviour
     the sidecar is NOT consulted and no ``reasoning_effort`` is injected.
 * Sidecar failure / timeout: falls back to ``DEFAULT_REASONING_EFFORT``
     (if set), otherwise the request is forwarded as-is.
+* Streaming responses (``stream: true``) are prefixed with
+  ``delta.reasoning`` chunks announcing the effort —
+  "D\u00e9termination de l'effort de raisonnement\u2026" then
+  "Effort: {effort}" — so Open WebUI shows it in its collapsible
+  thinking box before the answer starts. When the client supplies its
+  own effort, only the echo "Effort: {effort}" is sent. Disable with
+  ``EFFORT_NOTIFY=0``.
 * ``GET /v1/models`` and ``GET /models`` (model lists): each model is
   reported with ``"loaded": true`` and
   ``"status": {"value": "loaded"}`` when the backend does not provide
@@ -62,6 +69,8 @@ DEFAULT_REASONING_EFFORT    fallback effort when the sidecar fails /
 CONTEXT_TURNS               how many trailing turns to send to the sidecar
                             (default 2)
 MAX_PROMPT_CHARS            char budget sent to the sidecar (default 6000)
+EFFORT_NOTIFY               announce the effort in the stream
+                            (default on)
 LOG_LEVEL                   default INFO
 """
 
@@ -107,9 +116,34 @@ CONFIG: dict[str, Any] = {
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidecar_prompt.txt"),
     ),
     "default_effort": _env("DEFAULT_REASONING_EFFORT", "").strip().lower(),
+    "effort_notify": _env("EFFORT_NOTIFY", "1") not in ("0", "false", "no", "off"),
     "context_turns": max(1, int(_env("CONTEXT_TURNS", "2"))),
     "max_prompt_chars": int(_env("MAX_PROMPT_CHARS", "6000")),
 }
+
+
+def _reasoning_prefix(announce_texts: list[str], model: Any) -> bytes:
+    """Build SSE chunks announcing the effort via ``delta.reasoning``.
+
+    Open WebUI renders ``delta.reasoning`` in its collapsible "thinking"
+    box, so the effort shows up there without polluting the message
+    content or the stored conversation history.
+    """
+    cid = f"rproxy-{time.time_ns()}"
+    out = bytearray()
+    for i, text in enumerate(announce_texts):
+        delta = {"reasoning": text}
+        if i == 0:
+            delta = {"role": "assistant", **delta}
+        chunk = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model if isinstance(model, str) and model else "reasoning-proxy",
+            "choices": [{"index": 0, "delta": delta}],
+        }
+        out += f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+    return bytes(out)
 if CONFIG["default_effort"] and CONFIG["default_effort"] not in CONFIG["efforts"]:
     CONFIG["efforts"].append(CONFIG["default_effort"])
 
@@ -377,6 +411,7 @@ async def proxy(request: Request, path: str):
 
     # ---- possible interception: chat completions without an effort ----
     forwarded = raw
+    reasoning_prefix = b""  # SSE chunks announced before the backend stream
     is_chat = (
         request.method == "POST"
         and request.url.path.rstrip("/").endswith("/chat/completions")
@@ -395,6 +430,15 @@ async def proxy(request: Request, path: str):
         given = client_effort(body)
         if given is not None:
             log.info("client supplied reasoning_effort=%r -> forwarding as-is", given)
+            if (
+                CONFIG["effort_notify"]
+                and body.get("stream") is True
+                and isinstance(given, str)
+                and given.strip()
+            ):
+                reasoning_prefix = _reasoning_prefix(
+                    [f"Effort: {given.strip()}"], body.get("model")
+                )
         elif thinking_disabled(body):
             log.info(
                 "enable_thinking=false -> forwarding prompt as-is (no sidecar, no injection)"
@@ -409,6 +453,14 @@ async def proxy(request: Request, path: str):
                 merged["chat_template_kwargs"] = ctk
                 forwarded = json.dumps(merged).encode()
                 log.info("reasoning_effort=%s injected (source=%s)", effort, source)
+                if CONFIG["effort_notify"] and body.get("stream") is True:
+                    reasoning_prefix = _reasoning_prefix(
+                        [
+                            "D\u00e9termination de l\u2019effort de raisonnement\u2026\n",
+                            f"Effort: {effort}",
+                        ],
+                        body.get("model"),
+                    )
             else:
                 log.info("no effort -> forwarding as-is (source=%s)", source)
 
@@ -481,6 +533,10 @@ async def proxy(request: Request, path: str):
 
     async def gen():
         try:
+            if reasoning_prefix:
+                # Announce the effort (delta.reasoning) before the first
+                # backend chunk reaches Open WebUI.
+                yield reasoning_prefix
             async for chunk in resp.aiter_bytes():
                 yield chunk
         finally:
