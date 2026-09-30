@@ -17,6 +17,11 @@ Behaviour
     (either in ``chat_template_kwargs`` or top-level — this is what
     Open WebUI sends when the user fills the "Advanced options" field):
     the body is forwarded byte-for-byte, the sidecar is NOT consulted.
+* ``POST */chat/completions`` with
+  ``chat_template_kwargs.enable_thinking = false``:
+    thinking is explicitly disabled, so reasoning effort is meaningless —
+    the request (prompt included) is forwarded as-is to the main LLM,
+    the sidecar is NOT consulted and no ``reasoning_effort`` is injected.
 * Sidecar failure / timeout: falls back to ``DEFAULT_REASONING_EFFORT``
     (if set), otherwise the request is forwarded as-is.
 * Everything else (``/v1/models``, audio, tools, streaming, headers,
@@ -153,6 +158,18 @@ def client_effort(body: dict) -> Any | None:
     if body.get("reasoning_effort") is not None:
         return body["reasoning_effort"]
     return None
+
+
+def thinking_disabled(body: dict) -> bool:
+    """True when the client explicitly turned thinking off via
+    ``chat_template_kwargs.enable_thinking = false`` — in that case the
+    prompt must reach the main LLM untouched (no effort injection)."""
+    ctk = body.get("chat_template_kwargs")
+    if isinstance(ctk, dict):
+        v = ctk.get("enable_thinking")
+        if v is False or (isinstance(v, str) and v.strip().lower() == "false"):
+            return True
+    return False
 
 
 def build_conversation_text(body: dict) -> str:
@@ -349,6 +366,10 @@ async def proxy(request: Request, path: str):
         given = client_effort(body)
         if given is not None:
             log.info("client supplied reasoning_effort=%r -> forwarding as-is", given)
+        elif thinking_disabled(body):
+            log.info(
+                "enable_thinking=false -> forwarding prompt as-is (no sidecar, no injection)"
+            )
         else:
             effort, source = await decide_effort(body, sidecar)
             if effort is not None:

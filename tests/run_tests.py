@@ -189,8 +189,36 @@ def main() -> int:
     received = client.get(f"http://127.0.0.1:{BACKEND_PORT}/received").json()["bodies"]
     check("T6 effort forwarded", received[-1].get("reasoning_effort") == "high")
 
-    # ---- T7: sidecar dead -> fallback DEFAULT_REASONING_EFFORT=medium ----
-    print("\n== T7: sidecar dead -> fallback effort ==")
+    # ---- T7: enable_thinking=false -> as-is (no sidecar, no injection) ----
+    print("\n== T7: enable_thinking=false -> prompt forwarded as-is ==")
+    before = client.get(f"http://127.0.0.1:{SIDECAR_PORT}/calls").json()["count"]
+    r = client.post(
+        f"{BASE}/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "a hard math proof question"}],
+            "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+    check("T7 status 200", r.status_code == 200, str(r.status_code))
+    after = client.get(f"http://127.0.0.1:{SIDECAR_PORT}/calls").json()["count"]
+    check("T7 sidecar NOT consulted", before == after, f"{before} -> {after}")
+    received = client.get(f"http://127.0.0.1:{BACKEND_PORT}/received").json()["bodies"]
+    last = received[-1]
+    check(
+        "T7 no reasoning_effort injected",
+        "reasoning_effort" not in (last.get("chat_template_kwargs") or {}),
+        json.dumps(last.get("chat_template_kwargs")),
+    )
+    check(
+        "T7 enable_thinking preserved",
+        (last.get("chat_template_kwargs") or {}).get("enable_thinking") is False,
+        json.dumps(last.get("chat_template_kwargs")),
+    )
+    check("T7 prompt untouched", last["messages"][0]["content"] == "a hard math proof question")
+
+    # ---- T8: sidecar dead -> fallback DEFAULT_REASONING_EFFORT=medium ----
+    print("\n== T8: sidecar dead -> fallback effort ==")
     sidecar_proc = procs[0]  # started first
     sidecar_proc.send_signal(signal.SIGTERM)
     sidecar_proc.wait(timeout=5)
@@ -198,18 +226,18 @@ def main() -> int:
         f"{BASE}/v1/chat/completions",
         json={"messages": [{"role": "user", "content": "a complex multi-step planning question"}], "stream": False},
     )
-    check("T7 status 200 (proxy still works)", r.status_code == 200, str(r.status_code))
+    check("T8 status 200 (proxy still works)", r.status_code == 200, str(r.status_code))
     received = client.get(f"http://127.0.0.1:{BACKEND_PORT}/received").json()["bodies"]
     check(
-        "T7 fallback effort applied",
+        "T8 fallback effort applied",
         received[-1].get("chat_template_kwargs", {}).get("reasoning_effort") == "medium",
         json.dumps(received[-1].get("chat_template_kwargs")),
     )
 
-    # ---- T8: proxy health ----
-    print("\n== T8: /proxy-health ==")
+    # ---- T9: proxy health ----
+    print("\n== T9: /proxy-health ==")
     r = client.get(f"{BASE}/proxy-health")
-    check("T8 health ok", r.json().get("status") == "ok")
+    check("T9 health ok", r.json().get("status") == "ok")
 
     kill_all()
     print("\n== RESULT ==")

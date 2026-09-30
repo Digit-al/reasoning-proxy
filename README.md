@@ -20,6 +20,7 @@ et le lui communique via `chat_template_kwargs.reasoning_effort`.
 |---|---|
 | `POST */chat/completions` **sans** `reasoning_effort` | Envoie les derniers tours de conversation au sidecar (LLM), reçoit `low`/`medium`/`xhigh`, **injecte** `chat_template_kwargs.reasoning_effort` puis transfère |
 | `reasoning_effort` déjà présent (dans `chat_template_kwargs` **ou** au top-level — c'est ce qu'envoie Open WebUI quand l'utilisateur remplit le champ *Advanced options*) | **Transfert byte-par-byte, sidecar non consulté** |
+| `chat_template_kwargs` contient `"enable_thinking": false` | L'effort est sans objet : le prompt est transféré **tel quel** au LLM principal, sidecar non consulté, aucune injection |
 | Sidecar HS / timeout | Repli sur `DEFAULT_REASONING_EFFORT` (si défini), sinon transfert tel quel |
 | `/v1/models`, `/v1/completions`, audio, tools, SSE… | Transfert **100 % transparent** (body, headers, status, streaming SSE byte-par-byte) |
 
@@ -139,6 +140,8 @@ Lève un backend mock, un sidecar mock et le proxy, puis vérifie :
 * effort injecté quand le client n'en donne pas (stream + non-stream) ;
 * transfert byte-par-byte + sidecar **non consulté** quand le client fournit
   `reasoning_effort` (dans `chat_template_kwargs` ou au top-level) ;
+* transfert tel quel + sidecar **non consulté** quand
+  `chat_template_kwargs` contient `"enable_thinking": false` ;
 * préservation des `tools`/`tool_choice`, des autres `chat_template_kwargs` ;
 * `/v1/models` transparent ;
 * repli `DEFAULT_REASONING_EFFORT` quand le sidecar est mort.
