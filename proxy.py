@@ -24,6 +24,13 @@ Behaviour
     the sidecar is NOT consulted and no ``reasoning_effort`` is injected.
 * Sidecar failure / timeout: falls back to ``DEFAULT_REASONING_EFFORT``
     (if set), otherwise the request is forwarded as-is.
+* ``GET /models`` (llama.cpp root model-management list, NOT
+  ``/v1/models``): each model is reported with
+  ``"status": {"value": "loaded"}`` (unless the backend already provides
+  one). This is what Open WebUI's llama.cpp connection reads to display
+  the green "loaded" dot — set **Provider = llama.cpp** in the OWUI
+  connection config for this to apply. Other ``/models/*`` management
+  routes are proxied untouched.
 * Everything else (``/v1/models``, audio, tools, streaming, headers,
   status codes…) is proxied completely untouched — including SSE streams.
 
@@ -392,6 +399,42 @@ async def proxy(request: Request, path: str):
         content=forwarded if raw else None,
     )
     resp = await backend.send(client_req, stream=True)
+
+    # ---- llama.cpp root model-management endpoints ----
+    # Open WebUI's llama.cpp connection reads GET /models (root, not
+    # /v1/models) and shows the green "loaded" dot when a model reports
+    # status.value == "loaded". Models reached through the proxy are
+    # always available, so report them as loaded (unless the backend
+    # already says otherwise).
+    p = request.url.path
+    if p == "/models" or p.startswith("/models/"):
+        ctype = resp.headers.get("content-type", "").lower()
+        if "json" in ctype:
+            body_bytes = await resp.aread()
+            await resp.aclose()
+            data: Any = None
+            try:
+                data = json.loads(body_bytes)
+            except Exception:
+                data = None
+            if data is not None:
+                models = data.get("data") if isinstance(data, dict) else data
+                if isinstance(models, list):
+                    for m in models:
+                        if isinstance(m, dict) and "status" not in m:
+                            m["status"] = {"value": "loaded"}
+                    log.info(
+                        "marked %d model(s) as loaded (llama.cpp management list)",
+                        len(models),
+                    )
+                return JSONResponse(data, status_code=resp.status_code)
+            # Unparseable JSON payload: return the raw bytes unchanged.
+            return StreamingResponse(
+                iter([body_bytes]),
+                status_code=resp.status_code,
+                headers={"content-type": "application/json"},
+            )
+
     out_headers: dict[str, str] = {}
     for k, v in resp.headers.items():
         lk = k.lower()

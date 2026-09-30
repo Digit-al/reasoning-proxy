@@ -22,6 +22,7 @@ et le lui communique via `chat_template_kwargs.reasoning_effort`.
 | `reasoning_effort` déjà présent (dans `chat_template_kwargs` **ou** au top-level — c'est ce qu'envoie Open WebUI quand l'utilisateur remplit le champ *Advanced options*) | **Transfert byte-par-byte, sidecar non consulté** |
 | `chat_template_kwargs` contient `"enable_thinking": false` | L'effort est sans objet : le prompt est transféré **tel quel** au LLM principal, sidecar non consulté, aucune injection |
 | Sidecar HS / timeout | Repli sur `DEFAULT_REASONING_EFFORT` (si défini), sinon transfert tel quel |
+| `GET /models` (liste de gestion racine de llama.cpp, pas `/v1/models`) | Chaque modèle est signalé `"status": {"value": "loaded"}` (sauf si le backend en indique un autre) → **point vert « chargé »** dans la liste des modèles OWUI (voir ci-dessous) |
 | `/v1/models`, `/v1/completions`, audio, tools, SSE… | Transfert **100 % transparent** (body, headers, status, streaming SSE byte-par-byte) |
 
 Le proxy n'altère **jamais** la réponse ni l'usage des tools : il ne touche
@@ -81,6 +82,27 @@ Admin → **Settings → Connections** → nouveau backend :
 * Type : *OpenAI*
 
 Le test de connexion passe (`/v1/models` est transféré tel quel).
+
+### Point vert « modèle chargé » (optionnel)
+
+Dans la liste des modèles OWUI, les modèles servis par le proxy
+apparaissent avec le petit maillon **External** (normal pour une
+connexion distante) mais sans point vert. Pour afficher le point vert
+« chargé » comme avec une connexion directe à llama.cpp :
+
+1. **Admin → Settings → Connections → modifier la connexion** (ou
+   l'ajouter) :
+   * **Provider** : `llama.cpp`
+   * **Connection Type** : laisser sur **Local** (défaut)
+2. OWUI lira alors `GET /models` **sans** `/v1` (l'URL de base est
+   raccourcie automatiquement : `…/v1` → racine) ; le proxy signale
+   chaque modèle `"status": {"value": "loaded"}` (les modèles étant
+   toujours disponibles via llama.cpp), donc le point vert apparaît.
+
+Aucun effet de côté notable : le maillon disparaît (type « local »),
+les outils d'éjection/chargement du panneau admin appellent
+`/models/load` et `/models/unload` qui sont bien servis par llama.cpp,
+et les requêtes chat restent transparentes.
 
 ## Côté llama.cpp (modèle principal)
 
@@ -142,6 +164,8 @@ Lève un backend mock, un sidecar mock et le proxy, puis vérifie :
   `reasoning_effort` (dans `chat_template_kwargs` ou au top-level) ;
 * transfert tel quel + sidecar **non consulté** quand
   `chat_template_kwargs` contient `"enable_thinking": false` ;
+* `GET /models` → modèles signalés `status.value = "loaded"`
+  (point vert OWUI), statuts explicites préservés, `/v1/models` intact ;
 * préservation des `tools`/`tool_choice`, des autres `chat_template_kwargs` ;
 * `/v1/models` transparent ;
 * repli `DEFAULT_REASONING_EFFORT` quand le sidecar est mort.

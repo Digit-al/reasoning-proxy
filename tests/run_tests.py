@@ -217,8 +217,27 @@ def main() -> int:
     )
     check("T7 prompt untouched", last["messages"][0]["content"] == "a hard math proof question")
 
-    # ---- T8: sidecar dead -> fallback DEFAULT_REASONING_EFFORT=medium ----
-    print("\n== T8: sidecar dead -> fallback effort ==")
+    # ---- T8: GET /models -> models reported as loaded (OWUI green dot) ----
+    print("\n== T8: GET /models management list -> status loaded injected ==")
+    r = client.get(f"{BASE}/models")
+    check("T8 status 200", r.status_code == 200, str(r.status_code))
+    mgmt = {m["model"]: m for m in r.json()["data"]}
+    check(
+        "T8 model without status gets status.loaded",
+        (mgmt.get("mock-model") or {}).get("status") == {"value": "loaded"},
+        json.dumps(mgmt.get("mock-model")),
+    )
+    check(
+        "T8 explicit status not overwritten",
+        (mgmt.get("mock-model-2") or {}).get("status", {}).get("value") == "unloaded",
+        json.dumps(mgmt.get("mock-model-2")),
+    )
+    # /v1/models stays untouched (no status field added)
+    r = client.get(f"{BASE}/v1/models")
+    check("T8 /v1/models untouched", r.json()["data"][0].get("status") is None)
+
+    # ---- T9: sidecar dead -> fallback DEFAULT_REASONING_EFFORT=medium ----
+    print("\n== T9: sidecar dead -> fallback effort ==")
     sidecar_proc = procs[0]  # started first
     sidecar_proc.send_signal(signal.SIGTERM)
     sidecar_proc.wait(timeout=5)
@@ -226,18 +245,18 @@ def main() -> int:
         f"{BASE}/v1/chat/completions",
         json={"messages": [{"role": "user", "content": "a complex multi-step planning question"}], "stream": False},
     )
-    check("T8 status 200 (proxy still works)", r.status_code == 200, str(r.status_code))
+    check("T9 status 200 (proxy still works)", r.status_code == 200, str(r.status_code))
     received = client.get(f"http://127.0.0.1:{BACKEND_PORT}/received").json()["bodies"]
     check(
-        "T8 fallback effort applied",
+        "T9 fallback effort applied",
         received[-1].get("chat_template_kwargs", {}).get("reasoning_effort") == "medium",
         json.dumps(received[-1].get("chat_template_kwargs")),
     )
 
-    # ---- T9: proxy health ----
-    print("\n== T9: /proxy-health ==")
+    # ---- T10: proxy health ----
+    print("\n== T10: /proxy-health ==")
     r = client.get(f"{BASE}/proxy-health")
-    check("T9 health ok", r.json().get("status") == "ok")
+    check("T10 health ok", r.json().get("status") == "ok")
 
     kill_all()
     print("\n== RESULT ==")

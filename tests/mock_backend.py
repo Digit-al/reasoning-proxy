@@ -47,6 +47,18 @@ async def models():
     return {"data": [{"id": "mock-model", "object": "model"}]}
 
 
+@app.get("/models")
+async def models_mgmt():
+    """llama.cpp root model-management list (no status on model 1,
+    explicit status on model 2 — must not be overwritten)."""
+    return {
+        "data": [
+            {"model": "mock-model", "size": 12345},
+            {"model": "mock-model-2", "status": {"value": "unloaded", "context": "unloaded by user"}},
+        ]
+    }
+
+
 @app.get("/received")
 async def received():
     return {"bodies": RECEIVED}
