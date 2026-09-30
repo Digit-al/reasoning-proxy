@@ -247,7 +247,7 @@ async def ask_sidecar(prompt_text: str, sidecar: httpx.AsyncClient) -> tuple[str
                 ),
             },
         ],
-        "max_tokens": 16,
+        "max_tokens": 64,
         "temperature": 0,
         "stream": False,
     }
@@ -259,13 +259,29 @@ async def ask_sidecar(prompt_text: str, sidecar: httpx.AsyncClient) -> tuple[str
     resp.raise_for_status()
     data = resp.json()
     choices = data.get("choices") or []
-    content = ""
-    if choices and isinstance(choices[0], dict):
-        content = (choices[0].get("message") or {}).get("content") or ""
-    effort = parse_effort(content)
+    msg = choices[0].get("message") if choices and isinstance(choices[0], dict) else None
+    if not isinstance(msg, dict):
+        msg = {}
+    # Look for the answer in every place a model may put it: `content` is
+    # sometimes empty when the backend streams its reasoning elsewhere
+    # (`reasoning_content`, `reasoning`, `text`, `raw` …).
+    candidates: list[str] = []
+    for field in ("content", "reasoning_content", "reasoning", "text", "raw"):
+        v = msg.get(field)
+        if isinstance(v, str) and v.strip():
+            candidates.append(v)
+    effort = None
+    for cand in candidates:
+        effort = parse_effort(cand)
+        if effort:
+            break
     dt = time.monotonic() - t0
     if effort is None:
-        raise ValueError(f"sidecar returned unrecognized effort: {content!r}")
+        log.warning("sidecar answer not recognized: message=%r", msg)
+        raise ValueError(
+            f"sidecar returned unrecognized effort: {msg.get('content')!r} "
+            f"(full: {msg!r})"
+        )
     return effort, dt
 
 
