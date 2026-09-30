@@ -250,6 +250,12 @@ async def ask_sidecar(prompt_text: str, sidecar: httpx.AsyncClient) -> tuple[str
         "max_tokens": 64,
         "temperature": 0,
         "stream": False,
+        # The sidecar is a quick classifier: never let it *think*. A
+        # reasoning model started with `--reasoning on` would otherwise
+        # burn its tokens on a thinking trace and return an empty
+        # `content`. Disabling thinking makes it answer the single word
+        # directly, whether the backend is `--reasoning on` or `off`.
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     headers = {}
     if CONFIG["sidecar_key"]:

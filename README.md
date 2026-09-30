@@ -18,7 +18,7 @@ et le lui communique via `chat_template_kwargs.reasoning_effort`.
 
 | Situation | Action du proxy |
 |---|---|
-| `POST */chat/completions` **sans** `reasoning_effort` | Envoie les derniers tours de conversation au sidecar (LLM), reçoit `low`/`medium`/`xhigh`, **injecte** `chat_template_kwargs.reasoning_effort` puis transfère |
+| `POST */chat/completions` **sans** `reasoning_effort` | Envoie les derniers tours de conversation au sidecar (LLM) avec `enable_thinking: false` (voir ci-dessous), reçoit `low`/`medium`/`xhigh`, **injecte** `chat_template_kwargs.reasoning_effort` puis transfère |
 | `reasoning_effort` déjà présent (dans `chat_template_kwargs` **ou** au top-level — c'est ce qu'envoie Open WebUI quand l'utilisateur remplit le champ *Advanced options*) | **Transfert byte-par-byte, sidecar non consulté** |
 | `chat_template_kwargs` contient `"enable_thinking": false` | L'effort est sans objet : le prompt est transféré **tel quel** au LLM principal, sidecar non consulté, aucune injection |
 | Sidecar HS / timeout | Repli sur `DEFAULT_REASONING_EFFORT` (si défini), sinon transfert tel quel |

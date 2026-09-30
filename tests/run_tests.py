@@ -121,6 +121,14 @@ def main() -> int:
     sidecar_sys = (sidecar_calls["last"].get("messages") or [{}])[0].get("content", "")
     check("T1 sidecar prompt from file with efforts", "xhigh" in sidecar_sys and "{efforts}" not in sidecar_sys, sidecar_sys[:120])
     check("T1 stream flag preserved", last.get("stream") is True)
+    # the sidecar request must disable thinking so a reasoning model
+    # answers directly whether it runs with --reasoning on or off
+    sidecar_ctk = sidecar_calls["last"].get("chat_template_kwargs") or {}
+    check(
+        "T1 sidecar gets enable_thinking=false",
+        sidecar_ctk.get("enable_thinking") is False,
+        json.dumps(sidecar_calls["last"].get("chat_template_kwargs")),
+    )
 
     # ---- T2: client sends effort via chat_template_kwargs -> as-is ----
     print("\n== T2: client provides reasoning_effort in chat_template_kwargs -> as-is ==")
