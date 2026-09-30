@@ -437,7 +437,7 @@ async def proxy(request: Request, path: str):
                 and given.strip()
             ):
                 reasoning_prefix = _reasoning_prefix(
-                    [f"Effort: {given.strip()}"], body.get("model")
+                    [f"Effort: {given.strip()}\n"], body.get("model")
                 )
         elif thinking_disabled(body):
             log.info(
@@ -457,7 +457,7 @@ async def proxy(request: Request, path: str):
                     reasoning_prefix = _reasoning_prefix(
                         [
                             "D\u00e9termination de l\u2019effort de raisonnement\u2026\n",
-                            f"Effort: {effort}",
+                            f"Effort: {effort}\n",
                         ],
                         body.get("model"),
                     )
