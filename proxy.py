@@ -456,8 +456,8 @@ async def proxy(request: Request, path: str):
                 if CONFIG["effort_notify"] and body.get("stream") is True:
                     reasoning_prefix = _reasoning_prefix(
                         [
-                            "D\u00e9termination de l\u2019effort de raisonnement\u2026\n",
-                            f"Effort: {effort}\n",
+                            "D\u00e9termination automatique de l\u2019effort de raisonnement\u2026\n",
+                            f"=> _{effort}_\n",
                         ],
                         body.get("model"),
                     )
