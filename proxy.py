@@ -24,12 +24,12 @@ Behaviour
     the sidecar is NOT consulted and no ``reasoning_effort`` is injected.
 * Sidecar failure / timeout: falls back to ``DEFAULT_REASONING_EFFORT``
     (if set), otherwise the request is forwarded as-is.
-* ``GET /models`` (llama.cpp root model-management list, NOT
-  ``/v1/models``): each model is reported with
-  ``"status": {"value": "loaded"}`` (unless the backend already provides
-  one). This is what Open WebUI's llama.cpp connection reads to display
-  the green "loaded" dot — set **Provider = llama.cpp** in the OWUI
-  connection config for this to apply. Other ``/models/*`` management
+* ``GET /v1/models`` and ``GET /models`` (model lists): each model is
+  reported with ``"loaded": true`` and
+  ``"status": {"value": "loaded"}`` when the backend does not provide
+  them. This makes Open WebUI display the green "loaded" dot for the
+  proxy's models exactly like a direct llama.cpp connection — with any
+  provider setting ("Défaut" included). Other ``/models/*`` management
   routes are proxied untouched.
 * Everything else (``/v1/models``, audio, tools, streaming, headers,
   status codes…) is proxied completely untouched — including SSE streams.
@@ -400,14 +400,15 @@ async def proxy(request: Request, path: str):
     )
     resp = await backend.send(client_req, stream=True)
 
-    # ---- llama.cpp root model-management endpoints ----
-    # Open WebUI's llama.cpp connection reads GET /models (root, not
-    # /v1/models) and shows the green "loaded" dot when a model reports
-    # status.value == "loaded". Models reached through the proxy are
-    # always available, so report them as loaded (unless the backend
-    # already says otherwise).
+    # ---- model list endpoints: report models as loaded to Open WebUI ----
+    # OWUI shows the green "loaded" dot when a model carries
+    # `loaded: true` (any provider, the field is passed through as-is)
+    # or `status.value == "loaded"` (Provider = llama.cpp, read from
+    # the management list). Models reached through the proxy are always
+    # available, so report them as loaded (unless the backend already
+    # says otherwise).
     p = request.url.path
-    if p == "/models" or p.startswith("/models/"):
+    if p in ("/models", "/v1/models") or p.startswith("/models/"):
         ctype = resp.headers.get("content-type", "").lower()
         if "json" in ctype:
             body_bytes = await resp.aread()
@@ -421,11 +422,22 @@ async def proxy(request: Request, path: str):
                 models = data.get("data") if isinstance(data, dict) else data
                 if isinstance(models, list):
                     for m in models:
-                        if isinstance(m, dict) and "status" not in m:
+                        if not isinstance(m, dict):
+                            continue
+                        if "status" not in m:
                             m["status"] = {"value": "loaded"}
+                        if "loaded" not in m:
+                            status = m.get("status")
+                            value = status.get("value") if isinstance(status, dict) else None
+                            m["loaded"] = (
+                                value in ("loaded", "sleeping")
+                                if value is not None
+                                else True
+                            )
                     log.info(
-                        "marked %d model(s) as loaded (llama.cpp management list)",
+                        "marked %d model(s) as loaded for Open WebUI (%s)",
                         len(models),
+                        p,
                     )
                 return JSONResponse(data, status_code=resp.status_code)
             # Unparseable JSON payload: return the raw bytes unchanged.

@@ -232,9 +232,16 @@ def main() -> int:
         (mgmt.get("mock-model-2") or {}).get("status", {}).get("value") == "unloaded",
         json.dumps(mgmt.get("mock-model-2")),
     )
-    # /v1/models stays untouched (no status field added)
+    # /v1/models is enriched too -> green dot even with provider "default"
     r = client.get(f"{BASE}/v1/models")
-    check("T8 /v1/models untouched", r.json()["data"][0].get("status") is None)
+    v1m = r.json()["data"][0]
+    check("T8 /v1/models marked loaded", v1m.get("loaded") is True, json.dumps(v1m))
+    check("T8 /v1/models status loaded", (v1m.get("status") or {}).get("value") == "loaded")
+    check(
+        "T8 unloaded model -> loaded false",
+        (mgmt.get("mock-model-2") or {}).get("loaded") is False,
+        json.dumps(mgmt.get("mock-model-2")),
+    )
 
     # ---- T9: sidecar dead -> fallback DEFAULT_REASONING_EFFORT=medium ----
     print("\n== T9: sidecar dead -> fallback effort ==")
