@@ -426,19 +426,17 @@ async def ask_sidecar(prompt_text: str, sidecar: httpx.AsyncClient) -> tuple[tup
     """Ask the sidecar model to classify the last message as
     ``(task, effort)`` via a JSON answer."""
     url = f"{CONFIG['sidecar_url']}/chat/completions"
+    user_content = (
+        f"Conversation (most recent message LAST):\n"
+        f"{prompt_text}\n\n"
+        "Classify the LAST user message and answer with a single "
+        'JSON object: {"task": "creative|reasoning", ' + '"effort": "<effort>"}'
+    )
     payload = {
         "model": CONFIG["sidecar_model"],
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Conversation (most recent message LAST):\n"
-                    f"{prompt_text}\n\n"
-                    "Classify the LAST user message and answer with a single "
-                    'JSON object: {"task": "creative|reasoning", ' + '"effort": "<effort>"}'
-                ),
-            },
+            {"role": "user", "content": user_content},
         ],
         "max_tokens": 64,
         "temperature": 0,
@@ -453,6 +451,10 @@ async def ask_sidecar(prompt_text: str, sidecar: httpx.AsyncClient) -> tuple[tup
     headers = {}
     if CONFIG["sidecar_key"]:
         headers["Authorization"] = f"Bearer {CONFIG['sidecar_key']}"
+    # Log the EXACT context sent to the sidecar and its RAW answer, so a
+    # misclassification can be reproduced/diagnosed later.
+    log.info("sidecar request context:\n%s", prompt_text)
+
     t0 = time.monotonic()
     resp = await sidecar.post(url, json=payload, headers=headers)
     resp.raise_for_status()
@@ -461,6 +463,7 @@ async def ask_sidecar(prompt_text: str, sidecar: httpx.AsyncClient) -> tuple[tup
     msg = choices[0].get("message") if choices and isinstance(choices[0], dict) else None
     if not isinstance(msg, dict):
         msg = {}
+    log.info("sidecar raw answer (dt=%.2fs): %r", time.monotonic() - t0, msg)
     # Look for the answer in every place a model may put it: `content` is
     # sometimes empty when the backend streams its reasoning elsewhere
     # (`reasoning_content`, `reasoning`, `text`, `raw` …).
