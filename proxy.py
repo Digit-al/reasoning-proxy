@@ -74,7 +74,10 @@ CONTEXT_TURNS               how many trailing turns to send to the sidecar
 MAX_PROMPT_CHARS            char budget sent to the sidecar (default 6000)
 EFFORT_NOTIFY               announce the effort in the stream
                             (default on)
-LOG_LEVEL                   default INFO
+LOG_LEVEL                   DEBUG, INFO (default), WARNING, ERROR. The
+                            sidecar request context / raw answer and
+                            httpx's "HTTP Request" lines are only
+                            emitted at DEBUG.
 """
 
 from __future__ import annotations
@@ -92,11 +95,23 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
+def _log_level() -> int:
+    # LOG_LEVEL: DEBUG, INFO (default), WARNING, ERROR
+    lvl = os.environ.get("LOG_LEVEL", "INFO").upper()
+    return getattr(logging, lvl, logging.INFO)
+
+
 logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    level=_log_level(),
     format="%(asctime)s %(levelname)s [reasoning-proxy] %(message)s",
 )
 log = logging.getLogger("reasoning-proxy")
+
+# Silence httpx's own "HTTP Request: …" INFO chatter unless LOG_LEVEL is
+# DEBUG: it is diagnostic noise, not a proxy decision.
+logging.getLogger("httpx").setLevel(
+    logging.DEBUG if _log_level() <= logging.DEBUG else logging.WARNING
+)
 
 
 def _env(name: str, default: str = "") -> str:
@@ -452,8 +467,8 @@ async def ask_sidecar(prompt_text: str, sidecar: httpx.AsyncClient) -> tuple[tup
     if CONFIG["sidecar_key"]:
         headers["Authorization"] = f"Bearer {CONFIG['sidecar_key']}"
     # Log the EXACT context sent to the sidecar and its RAW answer, so a
-    # misclassification can be reproduced/diagnosed later.
-    log.info("sidecar request context:\n%s", prompt_text)
+    # misclassification can be reproduced/diagnosed later (DEBUG only).
+    log.debug("sidecar request context:\n%s", prompt_text)
 
     t0 = time.monotonic()
     resp = await sidecar.post(url, json=payload, headers=headers)
@@ -463,7 +478,7 @@ async def ask_sidecar(prompt_text: str, sidecar: httpx.AsyncClient) -> tuple[tup
     msg = choices[0].get("message") if choices and isinstance(choices[0], dict) else None
     if not isinstance(msg, dict):
         msg = {}
-    log.info("sidecar raw answer (dt=%.2fs): %r", time.monotonic() - t0, msg)
+    log.debug("sidecar raw answer (dt=%.2fs): %r", time.monotonic() - t0, msg)
     # Look for the answer in every place a model may put it: `content` is
     # sometimes empty when the backend streams its reasoning elsewhere
     # (`reasoning_content`, `reasoning`, `text`, `raw` …).
