@@ -364,6 +364,28 @@ def main() -> int:
         json.dumps(n_backend3[-1].get("chat_template_kwargs")),
     )
 
+    # ---- T14: creative backend down -> transparent fallback to main ----
+    print("\n== T14: creative backend dead -> fallback to main backend ==")
+    creative_proc = procs[2]  # started third
+    creative_proc.send_signal(signal.SIGTERM)
+    creative_proc.wait(timeout=5)
+    r = client.post(
+        f"{BASE}/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "Write a creative poem about the sea"}], "stream": False},
+    )
+    check("T14 status 200 (main backend rescued the task)", r.status_code == 200, str(r.status_code))
+    n_backend4 = client.get(f"http://127.0.0.1:{BACKEND_PORT}/received").json()["bodies"]
+    check(
+        "T14 main backend received the creative task",
+        n_backend4[-1]["messages"][0]["content"] == "Write a creative poem about the sea",
+        n_backend4[-1]["messages"][0]["content"][:80],
+    )
+    check(
+        "T14 effort mapped to reasoning scale",
+        (n_backend4[-1].get("chat_template_kwargs") or {}).get("reasoning_effort") in ("low", "medium", "xhigh"),
+        json.dumps(n_backend4[-1].get("chat_template_kwargs")),
+    )
+
     # ---- T9: sidecar dead -> fallback DEFAULT_REASONING_EFFORT=medium ----
     print("\n== T9: sidecar dead -> fallback effort ==")
     sidecar_proc = procs[0]  # started first

@@ -569,6 +569,9 @@ async def proxy(request: Request, path: str):
     # Creative tasks may be routed to a dedicated backend; decide before
     # building the outbound request.
     target_client: httpx.AsyncClient = backend
+    routed_creative = False
+    injected_effort: str | None = None
+    original_model = body.get("model") if isinstance(body, dict) else None
 
     if body is not None:
         given = client_effort(body)
@@ -601,6 +604,7 @@ async def proxy(request: Request, path: str):
                 effort = pick_effort_for(effective_task, effort)
                 if use_creative:
                     target_client = request.app.state.creative_backend
+                    routed_creative = True
                     headers = dict(headers)
                     if CONFIG["creative_backend_key"]:
                         headers["Authorization"] = (
@@ -622,6 +626,7 @@ async def proxy(request: Request, path: str):
                 ctk["reasoning_effort"] = effort
                 merged["chat_template_kwargs"] = ctk
                 forwarded = json.dumps(merged).encode()
+                injected_effort = effort
                 log.info(
                     "task=%s reasoning_effort=%s injected (source=%s)",
                     task or "reasoning", effort, source,
@@ -645,7 +650,54 @@ async def proxy(request: Request, path: str):
         headers=headers,
         content=forwarded if raw else None,
     )
-    resp = await target_client.send(client_req, stream=True)
+    try:
+        resp = await target_client.send(client_req, stream=True)
+    except httpx.HTTPError as exc:
+        # Creative backend unreachable (or hard error before the response
+        # started): fall back to the main backend so a downed creative LLM
+        # never breaks chat — the prompt still gets a (reasoning-scale)
+        # effort and reaches the main LLM.
+        if routed_creative:
+            log.warning(
+                "creative backend %s unavailable (%s) -> retrying on main backend",
+                CONFIG["creative_backend"], exc,
+            )
+            target_client = backend
+            headers = {
+                k: v for k, v in request.headers.items()
+                if k.lower() not in SKIP_HEADERS
+            }
+            if CONFIG["backend_key"] and not any(
+                k.lower() == "authorization" for k in headers
+            ):
+                headers["Authorization"] = f"Bearer {CONFIG['backend_key']}"
+            target = CONFIG["backend"] + request.url.path
+            if request.url.query:
+                target = f"{target}?{request.url.query}"
+            if injected_effort is not None:
+                merged = dict(body)
+                if original_model is not None:
+                    # Restore the client's model: the creative model name
+                    # is not loaded on the main backend.
+                    merged["model"] = original_model
+                else:
+                    merged.pop("model", None)
+                ctk = merged.get("chat_template_kwargs")
+                ctk = dict(ctk) if isinstance(ctk, dict) else {}
+                ctk["reasoning_effort"] = pick_effort_for("reasoning", injected_effort)
+                merged["chat_template_kwargs"] = ctk
+                forwarded = json.dumps(merged).encode()
+            else:
+                forwarded = raw
+            client_req = target_client.build_request(
+                request.method,
+                target,
+                headers=headers,
+                content=forwarded if raw else None,
+            )
+            resp = await target_client.send(client_req, stream=True)
+        else:
+            raise
 
     # ---- model list endpoints: report models as loaded to Open WebUI ----
     # OWUI shows the green "loaded" dot when a model carries
