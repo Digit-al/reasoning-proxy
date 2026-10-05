@@ -161,14 +161,19 @@ def _reasoning_prefix(announce_texts: list[str], model: Any) -> bytes:
 
 
 def _route_block(lines: list[str]) -> list[str]:
-    """Open the identifiable routing block in the reasoning box."""
-    return ["===== CHOIX DU ROUTEUR ====="] + lines
+    """Open the identifiable routing block in the reasoning box.
+
+    The lines are embedded in a SINGLE text with real newlines: Open WebUI
+    concatenates ``delta.reasoning`` chunks as-is, so separate chunks per
+    line would be rendered glued together on one line.
+    """
+    return ["\n===== CHOIX DU ROUTEUR =====\n" + "\n".join(lines)]
 
 
 def _route_close(ttft: float | None = None) -> list[str]:
     """Close the routing block, with the measured TTFT when available."""
-    lines = ([f"TTFT: {ttft:.2f} s"] if ttft is not None else [])
-    return lines + ["===== FIN ====="]
+    ttft_line = f"TTFT: {ttft:.2f} s\n" if ttft is not None else ""
+    return ["\n" + ttft_line + "===== FIN =====\n"]
 
 
 def _announce_route(model: Any, task: str | None, effort: str | None,
