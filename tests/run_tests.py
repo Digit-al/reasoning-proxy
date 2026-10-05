@@ -128,11 +128,16 @@ def main() -> int:
     check("T1 status 200", r.status_code == 200, str(r.status_code))
     check("T1 SSE contains [DONE]", "data: [DONE]" in text)
     check("T1 stream contains model echo", "hello" in text)
-    # effort notification: announced in delta.reasoning before the backend chunks
+    # routing decision: announced in the reasoning box before the backend chunks
     reasoning = "".join(sse_reasoning(text))
     check(
         "T1 effort announced in reasoning",
-        "D\u00e9termination" in reasoning and "xhigh" in reasoning,
+        "===== CHOIX DU ROUTEUR =====" in reasoning and "xhigh" in reasoning,
+        reasoning[:200],
+    )
+    check(
+        "T1 routing block shows task and sidecar origin",
+        "T\u00e2che: reasoning" in reasoning and "sidecar" in reasoning,
         reasoning[:200],
     )
 
@@ -236,10 +241,21 @@ def main() -> int:
         json={"messages": [{"role": "user", "content": "hi"}], "stream": True, "reasoning_effort": "high"},
     )
     check("T6 echo status 200", r6.status_code == 200)
+    r6_reasoning = "".join(sse_reasoning(r6.text))
     check(
         "T6 client effort echoed in reasoning",
-        "Effort: high" in "".join(sse_reasoning(r6.text)),
-        "".join(sse_reasoning(r6.text))[:200],
+        "Effort: high" in r6_reasoning,
+        r6_reasoning[:200],
+    )
+    check(
+        "T6 router block present in reasoning",
+        "===== CHOIX DU ROUTEUR =====" in r6_reasoning,
+        r6_reasoning[:200],
+    )
+    check(
+        "T6 router block shows client origin",
+        "spécifié par le client" in r6_reasoning,
+        r6_reasoning[:200],
     )
 
     # ---- T7: enable_thinking=false -> as-is (no sidecar, no injection) ----

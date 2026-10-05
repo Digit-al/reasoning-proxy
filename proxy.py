@@ -25,12 +25,13 @@ Behaviour
 * Sidecar failure / timeout: falls back to ``DEFAULT_REASONING_EFFORT``
     (if set), otherwise the request is forwarded as-is.
 * Streaming responses (``stream: true``) are prefixed with
-  ``delta.reasoning`` chunks announcing the effort —
-  "D\u00e9termination de l'effort de raisonnement\u2026" then
-  "Effort: {effort}" — so Open WebUI shows it in its collapsible
-  thinking box before the answer starts. When the client supplies its
-  own effort, only the echo "Effort: {effort}" is sent. Disable with
-  ``EFFORT_NOTIFY=0``.
+  ``delta.reasoning`` chunks forming an identifiable "CHOIX DU ROUTEUR"
+  (router's choice) block in Open WebUI's collapsible thinking box:
+  the detected task, the injected effort (and its scale), the origin
+  of the decision (sidecar / client / default) and the backend chosen
+  (with model substitution). A "Note: …" line is added when the
+  creative backend is down and the request is retried on the main
+  backend. Disable with ``EFFORT_NOTIFY=0``.
 * ``GET /v1/models`` and ``GET /models`` (model lists): each model is
   reported with ``"loaded": true`` and
   ``"status": {"value": "loaded"}`` when the backend does not provide
@@ -155,6 +156,32 @@ def _reasoning_prefix(announce_texts: list[str], model: Any) -> bytes:
         }
         out += f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
     return bytes(out)
+
+
+def _route_block(lines: list[str]) -> list[str]:
+    """Format the router's decision as an identifiable reasoning-box block."""
+    return ["===== CHOIX DU ROUTEUR =====", *lines, "===== FIN ====="]
+
+
+def _announce_route(model: Any, task: str | None, effort: str | None,
+                    origin: str, backend: str, note: str | None = None) -> bytes:
+    """Build the reasoning-box announcement of a routing decision."""
+    scale = "échelle créative" if task == "creative" else "échelle raisonnement"
+    origin_fr = {
+        "sidecar": "sidecar (LLM d'analyse)",
+        "default": "EFFORT par défaut (sidecar indisponible)",
+        "fallback": "EFFORT par défaut (sidecar indisponible)",
+        "client": "spécifié par le client",
+    }.get(origin, origin)
+    lines = _route_block([
+        f"Tâche: {task or 'raisonnement'}",
+        f"Effort: {effort} ({scale})",
+        f"Décision: {origin_fr}",
+        f"Backend: {backend}",
+    ] + ([f"Note: {note}"] if note else []))
+    return _reasoning_prefix(lines, model)
+
+
 if CONFIG["default_effort"] and CONFIG["default_effort"] not in CONFIG["efforts"]:
     CONFIG["efforts"].append(CONFIG["default_effort"])
 
@@ -583,8 +610,12 @@ async def proxy(request: Request, path: str):
                 and isinstance(given, str)
                 and given.strip()
             ):
-                reasoning_prefix = _reasoning_prefix(
-                    [f"Effort: {given.strip()}\n"], body.get("model")
+                reasoning_prefix = _announce_route(
+                    body.get("model"),
+                    "reasoning",
+                    given.strip(),
+                    "client",
+                    target,
                 )
         elif thinking_disabled(body):
             log.info(
@@ -632,12 +663,12 @@ async def proxy(request: Request, path: str):
                     task or "reasoning", effort, source,
                 )
                 if CONFIG["effort_notify"] and body.get("stream") is True:
-                    reasoning_prefix = _reasoning_prefix(
-                        [
-                            "D\u00e9termination automatique de l\u2019effort de raisonnement",
-                            f" => ***{effort}***\n",
-                        ],
+                    reasoning_prefix = _announce_route(
                         body.get("model"),
+                        effective_task,
+                        effort,
+                        source,
+                        target,
                     )
             else:
                 log.info("no effort -> forwarding as-is (source=%s)", source)
@@ -674,6 +705,7 @@ async def proxy(request: Request, path: str):
             target = CONFIG["backend"] + request.url.path
             if request.url.query:
                 target = f"{target}?{request.url.query}"
+            fallback_effort = None
             if injected_effort is not None:
                 merged = dict(body)
                 if original_model is not None:
@@ -684,11 +716,26 @@ async def proxy(request: Request, path: str):
                     merged.pop("model", None)
                 ctk = merged.get("chat_template_kwargs")
                 ctk = dict(ctk) if isinstance(ctk, dict) else {}
-                ctk["reasoning_effort"] = pick_effort_for("reasoning", injected_effort)
+                fallback_effort = pick_effort_for("reasoning", injected_effort)
+                ctk["reasoning_effort"] = fallback_effort
                 merged["chat_template_kwargs"] = ctk
                 forwarded = json.dumps(merged).encode()
             else:
                 forwarded = raw
+            # Re-announce the routing decision: the backend actually used
+            # changed (creative backend down -> main backend).
+            if fallback_effort is not None and body.get("stream") is True:
+                reasoning_prefix = _announce_route(
+                    original_model,
+                    "reasoning",
+                    fallback_effort,
+                    source,
+                    target,
+                    note=(
+                        f"backend créatif {CONFIG['creative_backend']} indisponible"
+                        " -> repli sur le backend principal"
+                    ),
+                )
             client_req = target_client.build_request(
                 request.method,
                 target,
