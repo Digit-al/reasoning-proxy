@@ -691,12 +691,28 @@ async def proxy(request: Request, path: str):
                     task or "reasoning", effort, source,
                 )
                 if CONFIG["effort_notify"] and body.get("stream") is True:
+                    # Show the task the sidecar *detected* (not the effective
+                    # one used for routing) and explain any downgrade: a
+                    # creative task with no creative backend available is
+                    # handled by the main LLM on the reasoning scale.
+                    note = None
+                    if effective_task != task:
+                        note = (
+                            "pas de backend créatif disponible -> "
+                            "traitée comme reasoning (backend principal)"
+                        )
                     reasoning_prefix = _announce_route(
                         body.get("model"),
-                        effective_task,
+                        task,
                         effort,
                         source,
                         target,
+                        note=note,
+                        scale=(
+                            "échelle créative"
+                            if effective_task == "creative"
+                            else "échelle raisonnement"
+                        ),
                     )
             else:
                 log.info("no effort -> forwarding as-is (source=%s)", source)
