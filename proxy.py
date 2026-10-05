@@ -29,9 +29,11 @@ Behaviour
   (router's choice) block in Open WebUI's collapsible thinking box:
   the detected task, the injected effort (and its scale), the origin
   of the decision (sidecar / client / default) and the backend chosen
-  (with model substitution). A "Note: …" line is added when the
-  creative backend is down and the request is retried on the main
-  backend. Disable with ``EFFORT_NOTIFY=0``.
+  (with model substitution). When the creative backend is down and the
+  request is retried on the main backend, the block is rebuilt with a
+  "Note: …" line explaining the fallback. The block is closed right
+  after the first backend byte, with the measured TTFT (time from
+  request arrival to first backend byte). Disable with ``EFFORT_NOTIFY=0``.
 * ``GET /v1/models`` and ``GET /models`` (model lists): each model is
   reported with ``"loaded": true`` and
   ``"status": {"value": "loaded"}`` when the backend does not provide
@@ -159,23 +161,38 @@ def _reasoning_prefix(announce_texts: list[str], model: Any) -> bytes:
 
 
 def _route_block(lines: list[str]) -> list[str]:
-    """Format the router's decision as an identifiable reasoning-box block."""
-    return ["===== CHOIX DU ROUTEUR =====", *lines, "===== FIN ====="]
+    """Open the identifiable routing block in the reasoning box."""
+    return ["===== CHOIX DU ROUTEUR ====="] + lines
+
+
+def _route_close(ttft: float | None = None) -> list[str]:
+    """Close the routing block, with the measured TTFT when available."""
+    lines = ([f"TTFT: {ttft:.2f} s"] if ttft is not None else [])
+    return lines + ["===== FIN ====="]
 
 
 def _announce_route(model: Any, task: str | None, effort: str | None,
-                    origin: str, backend: str, note: str | None = None) -> bytes:
-    """Build the reasoning-box announcement of a routing decision."""
-    scale = "échelle créative" if task == "creative" else "échelle raisonnement"
+                    origin: str, backend: str, note: str | None = None,
+                    scale: str | None = None) -> bytes:
+    """Build the reasoning-box announcement of a routing decision.
+
+    The block is left OPEN: it is closed (``TTFT`` + ``===== FIN =====``)
+    by the streaming generator right after the first backend byte, so the
+    TTFT (arrival of the request -> first byte from the backend) is
+    reported to the client.
+    """
+    if scale is None:
+        scale = "échelle créative" if task == "creative" else "échelle raisonnement"
     origin_fr = {
         "sidecar": "sidecar (LLM d'analyse)",
         "default": "EFFORT par défaut (sidecar indisponible)",
         "fallback": "EFFORT par défaut (sidecar indisponible)",
         "client": "spécifié par le client",
+        "passthrough": "aucun effort (transfert tel quel)",
     }.get(origin, origin)
     lines = _route_block([
         f"Tâche: {task or 'raisonnement'}",
-        f"Effort: {effort} ({scale})",
+        f"Effort: {effort or '—'} ({scale})",
         f"Décision: {origin_fr}",
         f"Backend: {backend}",
     ] + ([f"Note: {note}"] if note else []))
@@ -563,6 +580,9 @@ async def proxy(request: Request, path: str):
             status_code=503,
         )
 
+    # TTFT reference: when the request reached the proxy.
+    arrived_at = time.time()
+
     raw = await request.body()
     target = CONFIG["backend"] + request.url.path
     if request.url.query:
@@ -723,18 +743,23 @@ async def proxy(request: Request, path: str):
             else:
                 forwarded = raw
             # Re-announce the routing decision: the backend actually used
-            # changed (creative backend down -> main backend).
-            if fallback_effort is not None and body.get("stream") is True:
+            # changed (creative backend down -> main backend). The block is
+            # rebuilt (it was opened before the first send attempt) so the
+            # client clearly sees why the task went to the other LLM.
+            if body.get("stream") is True:
                 reasoning_prefix = _announce_route(
                     original_model,
-                    "reasoning",
+                    "creative",
                     fallback_effort,
                     source,
                     target,
                     note=(
-                        f"backend créatif {CONFIG['creative_backend']} indisponible"
-                        " -> repli sur le backend principal"
+                        f"backend créatif {CONFIG['creative_backend']} "
+                        "indisponible -> repli sur le backend principal"
                     ),
+                    scale="échelle raisonnement (recalé)"
+                    if fallback_effort
+                    else None,
                 )
             client_req = target_client.build_request(
                 request.method,
@@ -823,14 +848,26 @@ async def proxy(request: Request, path: str):
             out_headers[lk] = v
 
     async def gen():
+        block_open = bool(reasoning_prefix)
         try:
             if reasoning_prefix:
-                # Announce the effort (delta.reasoning) before the first
-                # backend chunk reaches Open WebUI.
+                # Announce the routing decision (delta.reasoning) before the
+                # first backend chunk reaches Open WebUI. The block is left
+                # open and closed below, right after the first backend byte.
                 yield reasoning_prefix
             async for chunk in resp.aiter_bytes():
+                if block_open:
+                    block_open = False
+                    # First backend byte: close the routing block with the
+                    # measured TTFT (request arrival -> first backend byte).
+                    ttft = time.time() - arrived_at
+                    yield _reasoning_prefix(_route_close(ttft), None)
                 yield chunk
         finally:
+            if block_open:
+                # Stream ended (or errored) before any backend byte:
+                # close the block without a TTFT.
+                yield _reasoning_prefix(_route_close(), None)
             await resp.aclose()
 
     return StreamingResponse(

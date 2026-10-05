@@ -140,6 +140,11 @@ def main() -> int:
         "T\u00e2che: reasoning" in reasoning and "sidecar" in reasoning,
         reasoning[:200],
     )
+    check(
+        "T1 routing block closed with TTFT",
+        "TTFT:" in reasoning and "===== FIN =====" in reasoning,
+        reasoning[-200:],
+    )
 
     sidecar_calls = client.get(f"http://127.0.0.1:{SIDECAR_PORT}/calls").json()
     check("T1 sidecar consulted once", sidecar_calls["count"] == 1, str(sidecar_calls["count"]))
@@ -400,6 +405,25 @@ def main() -> int:
         "T14 effort mapped to reasoning scale",
         (n_backend4[-1].get("chat_template_kwargs") or {}).get("reasoning_effort") in ("low", "medium", "xhigh"),
         json.dumps(n_backend4[-1].get("chat_template_kwargs")),
+    )
+    # streaming: the fallback is clearly reported in the routing block
+    r14s = client.post(
+        f"{BASE}/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "Write a creative poem about the sea"}], "stream": True},
+    )
+    check("T14s status 200", r14s.status_code == 200, str(r14s.status_code))
+    r14s_reasoning = "".join(sse_reasoning(r14s.text))
+    check(
+        "T14s fallback clearly reported in routing block",
+        "===== CHOIX DU ROUTEUR =====" in r14s_reasoning
+        and "indisponible" in r14s_reasoning
+        and "repli sur le backend principal" in r14s_reasoning,
+        r14s_reasoning[-300:],
+    )
+    check(
+        "T14s fallback block shows main backend URL",
+        f"http://127.0.0.1:{BACKEND_PORT}" in r14s_reasoning,
+        r14s_reasoning[-300:],
     )
 
     # ---- T9: sidecar dead -> fallback DEFAULT_REASONING_EFFORT=medium ----
