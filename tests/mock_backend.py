@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 app = FastAPI()
 RECEIVED: list[dict] = []
 PORT = int(os.environ.get("PORT", "18081"))
+MODEL_ID = os.environ.get("MODEL_ID", "mock-model")
 
 
 def _sse(payload: list[dict]) -> "StreamingResponse":
@@ -44,7 +45,7 @@ async def chat(request: Request):
 
 @app.get("/v1/models")
 async def models():
-    return {"data": [{"id": "mock-model", "object": "model"}]}
+    return {"data": [{"id": MODEL_ID, "object": "model"}]}
 
 
 @app.get("/models")
@@ -53,8 +54,8 @@ async def models_mgmt():
     explicit status on model 2 — must not be overwritten)."""
     return {
         "data": [
-            {"model": "mock-model", "size": 12345},
-            {"model": "mock-model-2", "status": {"value": "unloaded", "context": "unloaded by user"}},
+            {"model": MODEL_ID, "size": 12345},
+            {"model": MODEL_ID + "-2", "status": {"value": "unloaded", "context": "unloaded by user"}},
         ]
     }
 

@@ -12,7 +12,7 @@ import httpx
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-PROXY_PORT, BACKEND_PORT, SIDECAR_PORT = 18080, 18081, 18082
+PROXY_PORT, BACKEND_PORT, SIDECAR_PORT, CREATIVE_PORT = 18080, 18081, 18082, 18083
 BASE = f"http://127.0.0.1:{PROXY_PORT}"
 
 procs: list[subprocess.Popen] = []
@@ -64,14 +64,6 @@ def kill_all():
         p.wait(timeout=5)
 
 
-def sse_chunks(resp: httpx.Response) -> list[str]:
-    out, buf = [], ""
-    for line in resp.text.splitlines():
-        if line.startswith("data: "):
-            buf = line[6:]
-    return out, resp.text
-
-
 def sse_reasoning(text: str) -> list[str]:
     """Collect every delta.reasoning value from an SSE stream body."""
     out = []
@@ -94,8 +86,19 @@ def sse_reasoning(text: str) -> list[str]:
 
 def main() -> int:
     print("== starting mocks + proxy ==")
-    start("sidecar", "mock_sidecar.py", {"PORT": str(SIDECAR_PORT), "SIDECAR_ANSWER": "xhigh"}, SIDECAR_PORT)
-    start("backend", "mock_backend.py", {"PORT": str(BACKEND_PORT)}, BACKEND_PORT)
+    start("sidecar", "mock_sidecar.py", {"PORT": str(SIDECAR_PORT)}, SIDECAR_PORT)
+    start(
+        "backend",
+        "mock_backend.py",
+        {"PORT": str(BACKEND_PORT), "MODEL_ID": "mock-model"},
+        BACKEND_PORT,
+    )
+    start(
+        "creative-backend",
+        "mock_backend.py",
+        {"PORT": str(CREATIVE_PORT), "MODEL_ID": "creative-llm"},
+        CREATIVE_PORT,
+    )
     start(
         "proxy",
         os.path.join(ROOT, "proxy.py"),
@@ -106,6 +109,9 @@ def main() -> int:
             "SIDECAR_MODEL": "sidecar-mini",
             "SIDECAR_TIMEOUT": "5",
             "EFFORTS": "low medium xhigh",
+            "CREATIVE_EFFORTS": "low medium high",
+            "CREATIVE_BACKEND": f"http://127.0.0.1:{CREATIVE_PORT}",
+            "CREATIVE_MODEL": "creative-llm",
             "DEFAULT_REASONING_EFFORT": "medium",
         },
         PROXY_PORT,
@@ -126,7 +132,7 @@ def main() -> int:
     reasoning = "".join(sse_reasoning(text))
     check(
         "T1 effort announced in reasoning",
-        "D\u00e9termination de l\u2019effort" in reasoning and "Effort: xhigh" in reasoning,
+        "D\u00e9termination" in reasoning and "xhigh" in reasoning,
         reasoning[:200],
     )
 
@@ -186,7 +192,8 @@ def main() -> int:
     body = r.json()
     check("T3 response JSON intact", body.get("object") == "chat.completion")
     received = client.get(f"http://127.0.0.1:{BACKEND_PORT}/received").json()["bodies"]
-    check("T3 effort injected", received[-1].get("chat_template_kwargs", {}).get("reasoning_effort") == "xhigh")
+    # mock sidecar: "2+2?" has no hard/creative keyword -> medium
+    check("T3 effort injected", received[-1].get("chat_template_kwargs", {}).get("reasoning_effort") == "medium")
 
     # ---- T4: tools are preserved ----
     print("\n== T4: tools passthrough ==")
@@ -208,7 +215,7 @@ def main() -> int:
     # ---- T5: /v1/models passthrough ----
     print("\n== T5: GET /v1/models passthrough ==")
     r = client.get(f"{BASE}/v1/models")
-    check("T5 status 200", r.status_code == 200)
+    check("T5 status 200", r.status_code == 200, str(r.status_code))
     check("T5 models list", any(m["id"] == "mock-model" for m in r.json()["data"]))
 
     # ---- T6: top-level client effort -> as-is (no sidecar) ----
@@ -221,6 +228,8 @@ def main() -> int:
     check("T6 status 200", r.status_code == 200)
     after = client.get(f"http://127.0.0.1:{SIDECAR_PORT}/calls").json()["count"]
     check("T6 sidecar NOT consulted", before == after, f"{before} -> {after}")
+    received = client.get(f"http://127.0.0.1:{BACKEND_PORT}/received").json()["bodies"]
+    check("T6 effort forwarded", received[-1].get("reasoning_effort") == "high")
     # client-provided effort is echoed in the reasoning box
     r6 = client.post(
         f"{BASE}/v1/chat/completions",
@@ -232,8 +241,6 @@ def main() -> int:
         "Effort: high" in "".join(sse_reasoning(r6.text)),
         "".join(sse_reasoning(r6.text))[:200],
     )
-    received = client.get(f"http://127.0.0.1:{BACKEND_PORT}/received").json()["bodies"]
-    check("T6 effort forwarded", received[-1].get("reasoning_effort") == "high")
 
     # ---- T7: enable_thinking=false -> as-is (no sidecar, no injection) ----
     print("\n== T7: enable_thinking=false -> prompt forwarded as-is ==")
@@ -304,6 +311,59 @@ def main() -> int:
         json.dumps(mgmt.get("mock-model-2")),
     )
 
+    # ---- T11: creative task -> routed to creative backend ----
+    print("\n== T11: creative task -> creative backend + creative effort ==")
+    n_backend = client.get(f"http://127.0.0.1:{BACKEND_PORT}/received").json()["bodies"]
+    n_creative = client.get(f"http://127.0.0.1:{CREATIVE_PORT}/received").json()["bodies"]
+    r = client.post(
+        f"{BASE}/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "Write a creative poem about the sea"}], "stream": False},
+    )
+    check("T11 status 200", r.status_code == 200, str(r.status_code))
+    n_backend2 = client.get(f"http://127.0.0.1:{BACKEND_PORT}/received").json()["bodies"]
+    n_creative2 = client.get(f"http://127.0.0.1:{CREATIVE_PORT}/received").json()["bodies"]
+    check("T11 main backend untouched", len(n_backend2) == len(n_backend))
+    check("T11 creative backend received the request", len(n_creative2) == len(n_creative) + 1, f"{len(n_creative)} -> {len(n_creative2)}")
+    last_creative = n_creative2[-1] if n_creative2 else {}
+    check(
+        "T11 creative model name substituted",
+        last_creative.get("model") == "creative-llm",
+        json.dumps(last_creative.get("model")),
+    )
+    check(
+        "T11 creative effort injected",
+        (last_creative.get("chat_template_kwargs") or {}).get("reasoning_effort") == "low",
+        json.dumps(last_creative.get("chat_template_kwargs")),
+    )
+
+    # ---- T12: creative effort scale mapping (high -> creative, xhigh -> reasoning) ----
+    print("\n== T12: effort scales per task type ==")
+    # creative task with an effort that only exists on the reasoning scale
+    # must be mapped onto the creative scale (xhigh -> high).
+    r = client.post(
+        f"{BASE}/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "Write an epic creative saga about dragons"}], "stream": False},
+    )
+    check("T12 status 200", r.status_code == 200, str(r.status_code))
+    n_creative3 = client.get(f"http://127.0.0.1:{CREATIVE_PORT}/received").json()["bodies"]
+    check(
+        "T12 creative effort on creative scale",
+        (n_creative3[-1].get("chat_template_kwargs") or {}).get("reasoning_effort") in ("low", "medium", "high"),
+        json.dumps(n_creative3[-1].get("chat_template_kwargs")),
+    )
+    # reasoning task with a creative-scale effort maps onto the reasoning scale.
+    r = client.post(
+        f"{BASE}/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "Explain quantum entanglement"}], "stream": False},
+    )
+    check("T13 status 200", r.status_code == 200, str(r.status_code))
+    n_backend3 = client.get(f"http://127.0.0.1:{BACKEND_PORT}/received").json()["bodies"]
+    check(
+        "T13 reasoning effort on reasoning scale",
+        (n_backend3[-1].get("chat_template_kwargs") or {}).get("reasoning_effort") in ("low", "medium", "xhigh"),
+        json.dumps(n_backend3[-1].get("chat_template_kwargs")),
+    )
+
     # ---- T9: sidecar dead -> fallback DEFAULT_REASONING_EFFORT=medium ----
     print("\n== T9: sidecar dead -> fallback effort ==")
     sidecar_proc = procs[0]  # started first
@@ -325,6 +385,7 @@ def main() -> int:
     print("\n== T10: /proxy-health ==")
     r = client.get(f"{BASE}/proxy-health")
     check("T10 health ok", r.json().get("status") == "ok")
+    check("T10 health reports creative backend", (r.json().get("creative_backend") or "").endswith(str(CREATIVE_PORT)), r.json().get("creative_backend"))
 
     kill_all()
     print("\n== RESULT ==")

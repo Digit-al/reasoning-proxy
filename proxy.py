@@ -110,7 +110,18 @@ CONFIG: dict[str, Any] = {
     "sidecar_key": _env("SIDECAR_API_KEY", ""),
     "sidecar_model": _env("SIDECAR_MODEL", ""),
     "sidecar_timeout": float(_env("SIDECAR_TIMEOUT", "10")),
+    # Reasoning/agent task effort scale (main backend template).
     "efforts": [e.lower() for e in _env("EFFORTS", "low medium xhigh").split()],
+    # Creative task effort scale (creative backend template). May differ
+    # from the reasoning scale (e.g. creative LLM uses "high" not "xhigh").
+    "creative_efforts": [e.lower() for e in _env("CREATIVE_EFFORTS", "low medium high").split()],
+    # Optional dedicated backend for CREATIVE tasks. When empty, creative
+    # tasks are handled by the main (reasoning) backend.
+    "creative_backend": _env("CREATIVE_BACKEND", "").rstrip("/"),
+    "creative_backend_key": _env("CREATIVE_BACKEND_KEY", ""),
+    # Model name to use on the creative backend (empty = keep the model
+    # requested by the client, assuming it is loaded there too).
+    "creative_model": _env("CREATIVE_MODEL", ""),
     "prompt_file": _env(
         "SIDECAR_PROMPT_FILE",
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "sidecar_prompt.txt"),
@@ -148,25 +159,33 @@ if CONFIG["default_effort"] and CONFIG["default_effort"] not in CONFIG["efforts"
     CONFIG["efforts"].append(CONFIG["default_effort"])
 
 _DEFAULT_PROMPT = (
-    "You are a prompt complexity classifier. You will be given the end of a "
-    "conversation (the most recent message is LAST). Decide how much "
-    "reasoning effort an LLM needs to answer the user's LAST message well.\n"
-    "Allowed values: {efforts}\n"
-    "- low: simple facts, greetings, short direct answers, lookups, trivial "
-    "code, rewriting/summarizing short text.\n"
-    "- medium: standard questions needing some thought, routine multi-step "
-    "tasks, short code with a clear goal.\n"
-    "- xhigh: complex math/logic, proofs, debugging, architecture/planning, "
-    "long-form analysis, tricky edge cases, multi-part reasoning.\n"
-    "Answer with exactly one word: {efforts}. No explanation, just the word."
+    "You are a prompt classifier. You will be given the end of a conversation "
+    "(the most recent message is LAST). Classify the user's LAST message on "
+    "two dimensions, then answer with a SINGLE JSON object and nothing else.\n\n"
+    "1) Task type, exactly one of:\n"
+    "- \"creative\": writing, storytelling, brainstorming, marketing copy, "
+    "lyrics, role-play, open-ended expression, rewriting for style.\n"
+    "- \"reasoning\": analysis, math/logic, coding, debugging, planning, "
+    "multi-step or agentic tasks, fact lookup — anything where correctness "
+    "matters more than style.\n\n"
+    "2) Effort for that task, exactly one value from the scale that matches "
+    "the task type:\n"
+    "- task \"reasoning\" -> one of: {reasoning_efforts}\n"
+    "- task \"creative\"  -> one of: {creative_efforts}\n"
+    "Guidance: low = simple request, short direct output; medium = standard "
+    "request needing some thought or a full piece of text; {max_effort} = "
+    "exceptional complexity (long-form work, deep planning, tricky edge "
+    "cases, multi-part structure).\n\n"
+    "Answer format: {{\"task\": \"creative|reasoning\", \"effort\": \"<effort>\"}}"
 )
 
 
 def _load_sidecar_prompt() -> str:
     """Load the sidecar system prompt from SIDECAR_PROMPT_FILE, if present.
 
-    The placeholder {efforts} is replaced with the configured EFFORTS list.
-    A missing file falls back to the built-in default template.
+    Placeholders: {reasoning_efforts}, {creative_efforts}, {max_effort} and
+    legacy {efforts} (union of both scales). A missing file falls back to
+    the built-in default template.
     """
     path = CONFIG["prompt_file"]
     if path and os.path.isfile(path):
@@ -177,7 +196,13 @@ def _load_sidecar_prompt() -> str:
         if path:
             log.warning("sidecar prompt file %s not found -> built-in default", path)
         template = _DEFAULT_PROMPT
-    return template.replace("{efforts}", " / ".join(CONFIG["efforts"]))
+    scale = sorted(set(CONFIG["efforts"] + CONFIG["creative_efforts"]), key=len, reverse=True)
+    return (
+        template.replace("{reasoning_efforts}", " / ".join(CONFIG["efforts"]))
+        .replace("{creative_efforts}", " / ".join(CONFIG["creative_efforts"]))
+        .replace("{max_effort}", scale[0])
+        .replace("{efforts}", " / ".join(scale))
+    )
 
 
 SYSTEM_PROMPT = _load_sidecar_prompt()
@@ -255,17 +280,102 @@ def build_conversation_text(body: dict) -> str:
     return "\n\n".join(parts)
 
 
-def parse_effort(content: str) -> str | None:
-    """Extract the first recognized effort value from a sidecar answer."""
-    m = re.search(
-        r"\b(" + "|".join(re.escape(e) for e in sorted(CONFIG["efforts"], key=len, reverse=True)) + r")\b",
-        (content or "").lower(),
-    )
+def _parse_json_answer(content: str) -> dict | None:
+    """Parse the sidecar JSON answer, tolerating fences/prose around it."""
+    s = (content or "").strip()
+    if not s:
+        return None
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s).strip()
+    m = re.search(r"\{.*\}", s, re.DOTALL)  # first {...} block
+    candidate = m.group(0) if m else s
+    try:
+        data = json.loads(candidate)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _normalize_effort(value: Any, scale: list[str]) -> str | None:
+    """Map a sidecar effort token onto the scale for that task type.
+
+    Handles the usual aliases: `high` == `xhigh` when the scale has no
+    `high`, and vice-versa (creative templates often use `high` where
+    reasoning templates use `xhigh`).
+    """
+    if not isinstance(value, str):
+        return None
+    v = value.strip().lower()
+    if v in scale:
+        return v
+    aliases = {"high": "xhigh", "xhigh": "high", "medium": "med"}
+    for alt in aliases.get(v, []):
+        if alt in scale:
+            return alt
+    m = re.search(r"\b(" + "|".join(re.escape(e) for e in sorted(scale, key=len, reverse=True)) + r")\b", v)
     return m.group(1) if m else None
 
 
-async def ask_sidecar(prompt_text: str, sidecar: httpx.AsyncClient) -> tuple[str, float]:
-    """Ask the sidecar model which reasoning effort to use."""
+def parse_sidecar_answer(content: str) -> tuple[str, str | None] | None:
+    """Parse the sidecar answer into (task, effort) or None.
+
+    Accepted formats:
+    - JSON: {"task": "creative", "effort": "high"}
+    - Legacy single word: `xhigh` (task defaults to "reasoning")
+    """
+    data = _parse_json_answer(content)
+    if data is not None:
+        task_raw = data.get("task") or data.get("type") or data.get("type_de_tache")
+        task = ""
+        if isinstance(task_raw, str):
+            task = task_raw.strip().lower()
+            if any(w in task for w in ("crea", "créa")):
+                task = "creative"
+            elif any(w in task for w in ("reason", "réfl", "agent", "logique")):
+                task = "reasoning"
+            else:
+                task = "reasoning" if "reason" in task or "réfl" in task else "reasoning"
+        effort = _normalize_effort(
+            data.get("effort") or data.get("reasoning_effort"),
+            CONFIG["efforts"] + CONFIG["creative_efforts"],
+        )
+        # task absent (or unknown): only the effort is usable
+        if task not in ("creative", "reasoning"):
+            task = "reasoning"
+        if effort is not None:
+            return task, effort
+        return None
+    # Legacy: single effort word, no task.
+    m = re.search(
+        r"\b(" + "|".join(
+            re.escape(e) for e in sorted(
+                CONFIG["efforts"] + CONFIG["creative_efforts"], key=len, reverse=True
+            )
+        ) + r")\b",
+        (content or "").lower(),
+    )
+    if m:
+        return "reasoning", m.group(1)
+    return None
+
+
+def pick_effort_for(task: str, effort: str | None) -> str | None:
+    """Validate the effort against the scale of the chosen task type."""
+    scale = CONFIG["creative_efforts"] if task == "creative" else CONFIG["efforts"]
+    if effort:
+        e = _normalize_effort(effort, scale)
+        if e:
+            return e
+    # Best effort in the scale for that task.
+    if task == "creative":
+        return "medium" if "medium" in scale else (scale[1] if len(scale) > 1 else scale[0])
+    return "medium" if "medium" in scale else (scale[1] if len(scale) > 1 else scale[0])
+
+
+async def ask_sidecar(prompt_text: str, sidecar: httpx.AsyncClient) -> tuple[tuple[str, str | None], float]:
+    """Ask the sidecar model to classify the last message as
+    ``(task, effort)`` via a JSON answer."""
     url = f"{CONFIG['sidecar_url']}/chat/completions"
     payload = {
         "model": CONFIG["sidecar_model"],
@@ -276,8 +386,8 @@ async def ask_sidecar(prompt_text: str, sidecar: httpx.AsyncClient) -> tuple[str
                 "content": (
                     f"Conversation (most recent message LAST):\n"
                     f"{prompt_text}\n\n"
-                    f"Classify the LAST user message. Answer with exactly one word: "
-                    f"{' / '.join(CONFIG['efforts'])}."
+                    "Classify the LAST user message and answer with a single "
+                    'JSON object: {"task": "creative|reasoning", ' + '"effort": "<effort>"}'
                 ),
             },
         ],
@@ -310,37 +420,52 @@ async def ask_sidecar(prompt_text: str, sidecar: httpx.AsyncClient) -> tuple[str
         v = msg.get(field)
         if isinstance(v, str) and v.strip():
             candidates.append(v)
-    effort = None
+    parsed = None
     for cand in candidates:
-        effort = parse_effort(cand)
-        if effort:
+        parsed = parse_sidecar_answer(cand)
+        if parsed:
             break
     dt = time.monotonic() - t0
-    if effort is None:
+    if parsed is None:
         log.warning("sidecar answer not recognized: message=%r", msg)
         raise ValueError(
-            f"sidecar returned unrecognized effort: {msg.get('content')!r} "
+            f"sidecar returned unrecognized answer: {msg.get('content')!r} "
             f"(full: {msg!r})"
         )
-    return effort, dt
+    return parsed, dt
 
 
-async def decide_effort(body: dict, sidecar: httpx.AsyncClient) -> tuple[str | None, str]:
-    """Return (effort_or_None, source) for a request with no client effort."""
+async def decide_route(
+    body: dict, sidecar: httpx.AsyncClient
+) -> tuple[str | None, str | None, str]:
+    """Return (task, effort, source) for a request with no client effort.
+
+    ``task`` is "reasoning" or "creative" (None when no routing info could
+    be produced); ``effort`` is validated against the scale of the task.
+    """
     conv = build_conversation_text(body)
     if not CONFIG["sidecar_model"] or not conv.strip():
         if CONFIG["default_effort"]:
-            return CONFIG["default_effort"], "default"
-        return None, "passthrough"
+            return (
+                "reasoning",
+                pick_effort_for("reasoning", CONFIG["default_effort"]),
+                "default",
+            )
+        return None, None, "passthrough"
     try:
-        effort, dt = await ask_sidecar(conv, sidecar)
-        log.info("sidecar decided effort=%s (%.2fs)", effort, dt)
-        return effort, "sidecar"
+        (task, effort), dt = await ask_sidecar(conv, sidecar)
+        effort = pick_effort_for(task, effort)
+        log.info("sidecar decided task=%s effort=%s (%.2fs)", task, effort, dt)
+        return task, effort, "sidecar"
     except Exception as exc:
         log.warning("sidecar unavailable (%s)", exc)
         if CONFIG["default_effort"]:
-            return CONFIG["default_effort"], "fallback"
-        return None, "passthrough"
+            return (
+                "reasoning",
+                pick_effort_for("reasoning", CONFIG["default_effort"]),
+                "fallback",
+            )
+        return None, None, "passthrough"
 
 
 @asynccontextmanager
@@ -349,21 +474,33 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None),
         follow_redirects=True,
     )
+    creative_backend: httpx.AsyncClient | None = None
+    if CONFIG["creative_backend"]:
+        creative_backend = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None),
+            follow_redirects=True,
+        )
     sidecar = httpx.AsyncClient(timeout=CONFIG["sidecar_timeout"])
     app.state.backend = backend
+    app.state.creative_backend = creative_backend
     app.state.sidecar = sidecar
     log.info(
-        "backend=%s sidecar=%s model=%s efforts=%s default=%r",
+        "backend=%s creative_backend=%s sidecar=%s model=%s "
+        "efforts=%s creative_efforts=%s default=%r",
         CONFIG["backend"] or "(not set)",
+        CONFIG["creative_backend"] or "(not set)",
         CONFIG["sidecar_url"] or "(not set)",
         CONFIG["sidecar_model"] or "(not set)",
         CONFIG["efforts"],
+        CONFIG["creative_efforts"],
         CONFIG["default_effort"],
     )
     try:
         yield
     finally:
         await backend.aclose()
+        if creative_backend:
+            await creative_backend.aclose()
         await sidecar.aclose()
 
 
@@ -375,8 +512,11 @@ async def proxy_health() -> dict:
     return {
         "status": "ok",
         "backend": CONFIG["backend"] or None,
+        "creative_backend": CONFIG["creative_backend"] or None,
+        "creative_model": CONFIG["creative_model"] or None,
         "sidecar": CONFIG["sidecar_model"] or None,
         "efforts": CONFIG["efforts"],
+        "creative_efforts": CONFIG["creative_efforts"],
         "default_effort": CONFIG["default_effort"] or None,
     }
 
@@ -426,6 +566,10 @@ async def proxy(request: Request, path: str):
         if isinstance(parsed, dict):
             body = parsed
 
+    # Creative tasks may be routed to a dedicated backend; decide before
+    # building the outbound request.
+    target_client: httpx.AsyncClient = backend
+
     if body is not None:
         given = client_effort(body)
         if given is not None:
@@ -444,15 +588,44 @@ async def proxy(request: Request, path: str):
                 "enable_thinking=false -> forwarding prompt as-is (no sidecar, no injection)"
             )
         else:
-            effort, source = await decide_effort(body, sidecar)
+            task, effort, source = await decide_route(body, sidecar)
             if effort is not None:
+                # Route creative tasks to the dedicated backend when one is
+                # configured; otherwise everything stays on the main one.
+                use_creative = (
+                    task == "creative"
+                    and bool(CONFIG["creative_backend"])
+                    and request.app.state.creative_backend is not None
+                )
+                effective_task = "creative" if use_creative else "reasoning"
+                effort = pick_effort_for(effective_task, effort)
+                if use_creative:
+                    target_client = request.app.state.creative_backend
+                    headers = dict(headers)
+                    if CONFIG["creative_backend_key"]:
+                        headers["Authorization"] = (
+                            f"Bearer {CONFIG['creative_backend_key']}"
+                        )
+                    target = CONFIG["creative_backend"] + request.url.path
+                    if request.url.query:
+                        target = f"{target}?{request.url.query}"
+                    if CONFIG["creative_model"]:
+                        body = dict(body)
+                        body["model"] = CONFIG["creative_model"]
+                    log.info(
+                        "routing %s task to creative backend %s",
+                        task, CONFIG["creative_backend"],
+                    )
                 merged = dict(body)
                 ctk = merged.get("chat_template_kwargs")
                 ctk = dict(ctk) if isinstance(ctk, dict) else {}
                 ctk["reasoning_effort"] = effort
                 merged["chat_template_kwargs"] = ctk
                 forwarded = json.dumps(merged).encode()
-                log.info("reasoning_effort=%s injected (source=%s)", effort, source)
+                log.info(
+                    "task=%s reasoning_effort=%s injected (source=%s)",
+                    task or "reasoning", effort, source,
+                )
                 if CONFIG["effort_notify"] and body.get("stream") is True:
                     reasoning_prefix = _reasoning_prefix(
                         [
@@ -466,13 +639,13 @@ async def proxy(request: Request, path: str):
 
     # ---- transparent forwarding (streaming or not) ----
     log.debug("%s %s -> %s", request.method, request.url.path, target)
-    client_req = backend.build_request(
+    client_req = target_client.build_request(
         request.method,
         target,
         headers=headers,
         content=forwarded if raw else None,
     )
-    resp = await backend.send(client_req, stream=True)
+    resp = await target_client.send(client_req, stream=True)
 
     # ---- model list endpoints: report models as loaded to Open WebUI ----
     # OWUI shows the green "loaded" dot when a model carries
@@ -494,6 +667,25 @@ async def proxy(request: Request, path: str):
                 data = None
             if data is not None:
                 models = data.get("data") if isinstance(data, dict) else data
+                # When a dedicated creative backend is configured, merge
+                # its model list so both LLMs appear in Open WebUI.
+                if (
+                    isinstance(models, list)
+                    and CONFIG["creative_backend"]
+                    and target_client is backend
+                ):
+                    creative_models = await _fetch_creative_models(
+                        request.app.state.creative_backend
+                    )
+                    if creative_models:
+                        existing = {
+                            (m.get("id") or m.get("model")) for m in models if isinstance(m, dict)
+                        }
+                        for cm in creative_models:
+                            if isinstance(cm, dict) and (
+                                cm.get("id") or cm.get("model")
+                            ) not in existing:
+                                models.append(cm)
                 if isinstance(models, list):
                     for m in models:
                         if not isinstance(m, dict):
@@ -548,6 +740,35 @@ async def proxy(request: Request, path: str):
         headers=out_headers,
         background=BackgroundTask(_close_response, resp),
     )
+
+
+async def _fetch_creative_models(creative: httpx.AsyncClient | None) -> list[dict] | None:
+    """Fetch the creative backend's model list (best-effort, merged into
+    the main list so both LLMs show up in Open WebUI)."""
+    if creative is None:
+        return None
+    for base in ("/v1/models", "/models"):
+        try:
+            r = await creative.get(f"{CONFIG['creative_backend']}{base}")
+            if r.status_code == 200:
+                payload = r.json()
+                models = None
+                if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+                    models = payload["data"]
+                elif isinstance(payload, list):
+                    models = payload
+                if models is not None:
+                    # Normalize so both mgmt ("model") and v1 ("id") lists
+                    # show the model to Open WebUI.
+                    for m in models:
+                        if isinstance(m, dict):
+                            m["id"] = m.get("id") or m.get("model")
+                            m["model"] = m.get("model") or m.get("id")
+                    return models
+        except Exception as exc:
+            log.warning("creative backend model list unavailable (%s): %s", base, exc)
+            break
+    return None
 
 
 async def _close_response(resp: httpx.Response) -> None:

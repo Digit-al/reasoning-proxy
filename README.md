@@ -1,24 +1,29 @@
 # Reasoning-Effort Proxy
 
-Transparent proxy **Open WebUI → proxy → llama.cpp** qui décide, à chaque
-prompt, combien d'effort de raisonnement le modèle principal doit fournir,
-et le lui communique via `chat_template_kwargs.reasoning_effort`.
+Transparent proxy **Open WebUI → proxy → llama.cpp** qui, à chaque prompt :
+1. demande à un petit **sidecar** (LLM OpenAI-compatible) de **classifier**
+   la dernière message — type de tâche (`creative` / `reasoning`) **et** niveau
+d'effort ;
+2. **route** la requête vers le bon backend (modèle de réflexion/agentique
+ou modèle créatif) ;
+3. **injecte** l'effort dans `chat_template_kwargs.reasoning_effort`.
 
 ```
-                 ┌────────────────────────┐
- Open WebUI ───► │        PROXY           │ ───► llama.cpp (modèle principal)
- (port 8080)     │  (FastAPI, ce projet)  │        ex. port 8081
-                 │                        │
-                 │  si pas d'effort fourni│──► SIDECAR : petit LLM OpenAI-compatible
-                 │  → demande au sidecar  │    qui répond low / medium / xhigh
-                 └────────────────────────┘
+                                    ┌──► LLM réflexion/agentique (backend principal)
+ Open WebUI ───► PROXY ──► sidecar ─┤
+ (port 8080)     (FastAPI)   (task +   └──► LLM créatif (CREATIVE_BACKEND)
+                     effort)              (si configuré)
 ```
+
+Sans `CREATIVE_BACKEND`, toutes les tâches vont au backend principal.
+Le routage créatif est donc optionnel : le projet fonctionne exactement
+comme avant avec un seul LLM.
 
 ## Comportement
 
 | Situation | Action du proxy |
 |---|---|
-| `POST */chat/completions` **sans** `reasoning_effort` | Envoie les derniers tours de conversation au sidecar (LLM) avec `enable_thinking: false` (voir ci-dessous), reçoit `low`/`medium`/`xhigh`, **injecte** `chat_template_kwargs.reasoning_effort` puis transfère |
+| `POST */chat/completions` **sans** `reasoning_effort` | Envoie les derniers tours de conversation au sidecar (LLM) avec `enable_thinking: false` (voir ci-dessous), reçoit une réponse JSON `{"task": "creative|reasoning", "effort": "..."}`, **route** la requête vers le bon backend, **injecte** `chat_template_kwargs.reasoning_effort` puis transfère |
 | `reasoning_effort` déjà présent (dans `chat_template_kwargs` **ou** au top-level — c'est ce qu'envoie Open WebUI quand l'utilisateur remplit le champ *Advanced options*) | **Transfert byte-par-byte, sidecar non consulté** |
 | `chat_template_kwargs` contient `"enable_thinking": false` | L'effort est sans objet : le prompt est transféré **tel quel** au LLM principal, sidecar non consulté, aucune injection |
 | Réponse **streaming** (les cas ci-dessus + effort fourni par le client) | Le flux SSE est préfixé par des chunks `delta.reasoning` : « Détermination de l'effort de raisonnement… » puis « Effort: {effort} » (ou un simple écho « Effort: {effort} » quand le client a fourni sa valeur). Open WebUI les affiche dans la **boîte de réflexion** repliable, sans polluer le message ni l'historique. Désactivable via `EFFORT_NOTIFY=0` |
@@ -41,6 +46,10 @@ manquait.
 | `SIDECAR_API_KEY` | — | API key optionnelle du sidecar |
 | `SIDECAR_MODEL` | — (**requis**) | Nom du modèle sidecar |
 | `SIDECAR_TIMEOUT` | `10` | Timeout (s) de la requête au sidecar |
+| `CREATIVE_BACKEND` | *(vide)* | Base URL du backend **créatif** dédié (llama.cpp ou autre endpoint OpenAI-compatible). Vide = les tâches créatives vont au backend principal |
+| `CREATIVE_BACKEND_KEY` | — | API key optionnelle du backend créatif |
+| `CREATIVE_MODEL` | *(vide)* | Nom du modèle à utiliser sur le backend créatif. Vide = on garde le modèle demandé par le client (si le même modèle est chargé des deux côtés) |
+| `CREATIVE_EFFORTS` | `low medium high` | Échelle d'effort **des tâches créatives** (peut différer de l'échelle de raisonnement, ex. `high` au lieu de `xhigh`) |
 | `EFFORTS` | `low medium xhigh` | Valeurs autorisées. Pilote le parsing de la réponse du sidecar **et** le remplissage du placeholder `{efforts}` du prompt |
 | `SIDECAR_PROMPT_FILE` | `sidecar_prompt.txt` | Fichier du prompt système du sidecar, à personnaliser librement (langue, critères, valeurs hardcodées). `{efforts}` est remplacé par la liste de `EFFORTS` |
 | `DEFAULT_REASONING_EFFORT` | *(vide)* | Repli si sidecar HS / absent (vide = transfert tel quel) |
@@ -63,6 +72,13 @@ python3 proxy.py
 EFFORTS="low medium xhigh" python3 proxy.py
 # ou un prompt de sidecar entièrement personnalisé :
 EFFORTS="low medium xhigh" SIDECAR_PROMPT_FILE=/etc/proxy/sidecar_prompt.txt python3 proxy.py
+
+# Routage 2 LLM : réflexion/agentique (principal) + créatif (dedicated backend)
+LLAMA_BACKEND=http://127.0.0.1:8081 \
+CREATIVE_BACKEND=http://127.0.0.1:8082 \
+CREATIVE_EFFORTS="low medium high" \
+CREATIVE_MODEL=mon-llm-creatif \
+python3 proxy.py
 ```
 
 Docker :
