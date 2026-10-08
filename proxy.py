@@ -186,9 +186,31 @@ def _route_block(lines: list[str]) -> list[str]:
 
 
 def _route_close(ttft: float | None = None) -> list[str]:
-    """Close the routing block, with the measured TTFT when available."""
+    """Close the routing block, with the measured TTFT when available.
+
+    The TTFT is measured up to the first REAL token from the backend
+    (first non-announcement chunk), not to the first byte: backends such
+    as llama.cpp open the SSE stream (headers, keepalives, initial
+    chunk) well before generation starts.
+    """
     ttft_line = f"TTFT: {ttft:.2f} s\n" if ttft is not None else ""
     return ["\n" + ttft_line + "===== FIN =====\n"]
+
+
+def _sse_data_chunk(sse_event: bytes) -> dict | None:
+    """Return the parsed JSON of the event's ``data:`` line, or None when
+    the event is not a JSON chunk (keepalive comment, ``[DONE]``…)."""
+    for line in sse_event.split(b"\n"):
+        if line.startswith(b"data:"):
+            payload = line[5:].strip()
+            if payload == b"[DONE]" or payload[:1] != b"{":
+                return None
+            try:
+                data = json.loads(payload)
+            except Exception:
+                return None
+            return data if isinstance(data, dict) else None
+    return None
 
 
 def _announce_route(model: Any, task: str | None, effort: str | None,
@@ -888,25 +910,50 @@ async def proxy(request: Request, path: str):
 
     async def gen():
         block_open = bool(reasoning_prefix)
+        buf = b""
         try:
             if reasoning_prefix:
                 # Announce the routing decision (delta.reasoning) before the
                 # first backend chunk reaches Open WebUI. The block is left
-                # open and closed below, right after the first backend byte.
+                # open and closed below, on the first REAL backend token.
                 yield reasoning_prefix
             async for chunk in resp.aiter_bytes():
-                if block_open:
-                    block_open = False
-                    # First backend byte: close the routing block with the
-                    # measured TTFT (request arrival -> first backend byte).
-                    ttft = time.time() - arrived_at
-                    yield _reasoning_prefix(_route_close(ttft), None)
-                yield chunk
-        finally:
+                if not block_open:
+                    yield chunk
+                    continue
+                buf += chunk
+                # Inspect complete SSE events to find the first real token
+                # from the backend: the first chunk that is not one of our
+                # own announcements (id prefixed "rproxy-"). Keepalives
+                # and other non-chunk events do not count as tokens.
+                while True:
+                    idx = buf.find(b"\n\n")
+                    if idx < 0:
+                        break
+                    event = buf[:idx]
+                    buf = buf[idx + 2 :]
+                    data = _sse_data_chunk(event)
+                    if (
+                        block_open
+                        and data is not None
+                        and not str(data.get("id", "")).startswith("rproxy-")
+                    ):
+                        block_open = False
+                        ttft = time.time() - arrived_at
+                        yield _reasoning_prefix(_route_close(ttft), None)
+                    if event:
+                        yield event
+                if buf and not block_open:
+                    yield buf
+                    buf = b""
             if block_open:
-                # Stream ended (or errored) before any backend byte:
+                # Stream ended (or errored) before any real token:
                 # close the block without a TTFT.
+                block_open = False
                 yield _reasoning_prefix(_route_close(), None)
+            if buf:
+                yield buf
+        finally:
             await resp.aclose()
 
     return StreamingResponse(
