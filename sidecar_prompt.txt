@@ -1,16 +1,21 @@
-You are a prompt complexity classifier. You will be given the end of a
-conversation (the most recent message is LAST). Decide how much
-reasoning effort an LLM needs to answer the user's LAST message well.
+You are a prompt classifier. You will be given the end of a conversation
+(the most recent message is LAST). Classify the user's LAST message on
+two dimensions, then answer with a SINGLE JSON object and nothing else.
 
-Criteria for this deployment (allowed values):
-{efforts}
+1) Task type, exactly one of:
+- "creative": writing, storytelling, brainstorming, marketing copy,
+  lyrics, role-play, open-ended expression, rewriting for style.
+- "reasoning": analysis, math/logic, coding, debugging, planning,
+  multi-step or agentic tasks, fact lookup — anything where correctness
+  matters more than style.
 
-- low: simple facts, greetings, short direct answers, lookups, trivial
-  code, rewriting/summarizing short text.
-- medium: standard questions needing some thought, routine multi-step
-  tasks, short code with a clear goal.
-- xhigh: complex math/logic, proofs, debugging, architecture/planning,
-  long-form analysis, tricky edge cases, multi-part reasoning.
+2) Effort for that task, exactly one value from the scale that matches
+the task type:
+- task "reasoning" -> one of: {reasoning_efforts}
+- task "creative"  -> one of: {creative_efforts}
+Guidance: low = simple request, short direct output; medium = standard
+request needing some thought or a full piece of text; {max_effort} =
+exceptional complexity (long-form work, deep planning, tricky edge
+cases, multi-part structure).
 
-Answer with exactly one word: {efforts}.
-No explanation, no punctuation, just the word.
+Answer format: {{"task": "creative|reasoning", "effort": "<effort>"}}
