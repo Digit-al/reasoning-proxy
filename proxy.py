@@ -199,7 +199,13 @@ def _route_close(ttft: float | None = None) -> list[str]:
 
 def _sse_data_chunk(sse_event: bytes) -> dict | None:
     """Return the parsed JSON of the event's ``data:`` line, or None when
-    the event is not a JSON chunk (keepalive comment, ``[DONE]``…)."""
+    the event is not a JSON chunk (keepalive comment, ``[DONE]``…).
+
+    Returns a dict with at least an ``id`` key so the caller can check
+    whether it is one of our own announcements. If the JSON is not
+    fully parseable but the payload starts with ``{``, we return a
+    sentinel dict so the caller still treats it as a real token.
+    """
     for line in sse_event.split(b"\n"):
         if line.startswith(b"data:"):
             payload = line[5:].strip()
@@ -207,9 +213,15 @@ def _sse_data_chunk(sse_event: bytes) -> dict | None:
                 return None
             try:
                 data = json.loads(payload)
+                if isinstance(data, dict):
+                    return data
+                # JSON parsable but not a dict (list, str, etc.) — treat
+                # as a token so the block still closes.
+                return {"id": ""}
             except Exception:
-                return None
-            return data if isinstance(data, dict) else None
+                # JSON not parseable but looks like a chunk (starts with
+                # {) — treat as a token to be safe.
+                return {"id": ""}
     return None
 
 
@@ -911,6 +923,8 @@ async def proxy(request: Request, path: str):
     async def gen():
         block_open = bool(reasoning_prefix)
         buf = b""
+        first_byte_at: float | None = None
+        backend_bytes = 0  # total backend bytes seen while the block is open
         try:
             if reasoning_prefix:
                 # Announce the routing decision (delta.reasoning) before the
@@ -921,7 +935,14 @@ async def proxy(request: Request, path: str):
                 if not block_open:
                     yield chunk
                     continue
-                buf += chunk
+                # Record the first backend byte (fallback TTFT if token
+                # detection fails) and count backend bytes as a safety net.
+                if first_byte_at is None:
+                    first_byte_at = time.time()
+                backend_bytes += len(chunk)
+                # Normalize CRLF -> LF so that event boundaries are always
+                # b"\n\n" regardless of the backend's line endings.
+                buf = (buf + chunk).replace(b"\r\n", b"\n")
                 # Inspect complete SSE events to find the first real token
                 # from the backend: the first chunk that is not one of our
                 # own announcements (id prefixed "rproxy-"). Keepalives
@@ -943,14 +964,28 @@ async def proxy(request: Request, path: str):
                         yield _reasoning_prefix(_route_close(ttft), None)
                     if event:
                         yield event
+                # Safety net: the block must always close. If we have seen
+                # a meaningful amount of backend bytes but token detection
+                # never fired (non-standard SSE framing, or a run of
+                # keepalive/comment events that _sse_data_chunk returns
+                # None for), fall back to closing on the first byte.
+                if (
+                    block_open
+                    and first_byte_at is not None
+                    and backend_bytes > 4096
+                ):
+                    block_open = False
+                    ttft = first_byte_at - arrived_at
+                    yield _reasoning_prefix(_route_close(ttft), None)
                 if buf and not block_open:
                     yield buf
                     buf = b""
             if block_open:
                 # Stream ended (or errored) before any real token:
-                # close the block without a TTFT.
+                # close the block with the first-byte TTFT if available.
                 block_open = False
-                yield _reasoning_prefix(_route_close(), None)
+                ttft = (first_byte_at - arrived_at) if first_byte_at is not None else None
+                yield _reasoning_prefix(_route_close(ttft), None)
             if buf:
                 yield buf
         finally:
