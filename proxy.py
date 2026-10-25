@@ -981,8 +981,12 @@ async def proxy(request: Request, path: str):
                             ttft = time.time() - arrived_at
                             log.info("block CLOSED on first token, ttft=%.2f s", ttft)
                             yield _reasoning_prefix(_route_close(ttft), None)
+                        # Yield the event WITH its \n\n terminator to preserve
+                        # SSE framing. Without it, comments (keepalives) and
+                        # partial events glue onto the next chunk, making
+                        # the stream unparseable by OWUI.
                         if event:
-                            yield event
+                            yield event + b"\n\n"
                     # Safety net: the block must always close. If we have
                     # seen a meaningful amount of backend bytes but token
                     # detection never fired (non-standard SSE framing, or a
