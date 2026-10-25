@@ -925,66 +925,93 @@ async def proxy(request: Request, path: str):
         buf = b""
         first_byte_at: float | None = None
         backend_bytes = 0  # total backend bytes seen while the block is open
+        log.info("block open=%s, prefix=%r", block_open, (reasoning_prefix or b"")[:160])
         try:
             if reasoning_prefix:
                 # Announce the routing decision (delta.reasoning) before the
                 # first backend chunk reaches Open WebUI. The block is left
                 # open and closed below, on the first REAL backend token.
                 yield reasoning_prefix
-            async for chunk in resp.aiter_bytes():
-                if not block_open:
-                    yield chunk
-                    continue
-                # Record the first backend byte (fallback TTFT if token
-                # detection fails) and count backend bytes as a safety net.
-                if first_byte_at is None:
-                    first_byte_at = time.time()
-                backend_bytes += len(chunk)
-                # Normalize CRLF -> LF so that event boundaries are always
-                # b"\n\n" regardless of the backend's line endings.
-                buf = (buf + chunk).replace(b"\r\n", b"\n")
-                # Inspect complete SSE events to find the first real token
-                # from the backend: the first chunk that is not one of our
-                # own announcements (id prefixed "rproxy-"). Keepalives
-                # and other non-chunk events do not count as tokens.
-                while True:
-                    idx = buf.find(b"\n\n")
-                    if idx < 0:
-                        break
-                    event = buf[:idx]
-                    buf = buf[idx + 2 :]
-                    data = _sse_data_chunk(event)
+            try:
+                async for chunk in resp.aiter_bytes():
+                    if not block_open:
+                        yield chunk
+                        continue
+                    # Record the first backend byte (fallback TTFT if token
+                    # detection fails) and count backend bytes as a safety
+                    # net.
+                    if first_byte_at is None:
+                        first_byte_at = time.time()
+                        log.info(
+                            "first backend chunk (%d bytes): %r",
+                            len(chunk), chunk[:400],
+                        )
+                    backend_bytes += len(chunk)
+                    # Normalize CRLF -> LF so that event boundaries are
+                    # always b"\n\n" regardless of the backend's line
+                    # endings.
+                    buf = (buf + chunk).replace(b"\r\n", b"\n")
+                    # Inspect complete SSE events to find the first real
+                    # token from the backend: the first chunk that is not
+                    # one of our own announcements (id prefixed "rproxy-").
+                    # Keepalives and other non-chunk events do not count as
+                    # tokens.
+                    while True:
+                        idx = buf.find(b"\n\n")
+                        if idx < 0:
+                            break
+                        event = buf[:idx]
+                        buf = buf[idx + 2 :]
+                        data = _sse_data_chunk(event)
+                        is_announce = (
+                            data is not None
+                            and str(data.get("id", "")).startswith("rproxy-")
+                        )
+                        if block_open:
+                            log.info(
+                                "SSE event inspected (block open): data=%s announce=%s bytes=%r",
+                                data is not None, is_announce, event[:300],
+                            )
+                        if (
+                            block_open
+                            and data is not None
+                            and not is_announce
+                        ):
+                            block_open = False
+                            ttft = time.time() - arrived_at
+                            log.info("block CLOSED on first token, ttft=%.2f s", ttft)
+                            yield _reasoning_prefix(_route_close(ttft), None)
+                        if event:
+                            yield event
+                    # Safety net: the block must always close. If we have
+                    # seen a meaningful amount of backend bytes but token
+                    # detection never fired (non-standard SSE framing, or a
+                    # run of keepalive/comment events that _sse_data_chunk
+                    # returns None for), fall back to closing on the first
+                    # byte.
                     if (
                         block_open
-                        and data is not None
-                        and not str(data.get("id", "")).startswith("rproxy-")
+                        and first_byte_at is not None
+                        and backend_bytes > 4096
                     ):
                         block_open = False
-                        ttft = time.time() - arrived_at
+                        ttft = first_byte_at - arrived_at
+                        log.info(
+                            "block CLOSED by safety net (backend_bytes=%d), ttft=%.2f s",
+                            backend_bytes, ttft,
+                        )
                         yield _reasoning_prefix(_route_close(ttft), None)
-                    if event:
-                        yield event
-                # Safety net: the block must always close. If we have seen
-                # a meaningful amount of backend bytes but token detection
-                # never fired (non-standard SSE framing, or a run of
-                # keepalive/comment events that _sse_data_chunk returns
-                # None for), fall back to closing on the first byte.
-                if (
-                    block_open
-                    and first_byte_at is not None
-                    and backend_bytes > 4096
-                ):
-                    block_open = False
-                    ttft = first_byte_at - arrived_at
-                    yield _reasoning_prefix(_route_close(ttft), None)
-                if buf and not block_open:
-                    yield buf
-                    buf = b""
+                    if buf and not block_open:
+                        yield buf
+                        buf = b""
+            except Exception as exc:  # noqa: BLE001 - log then close block
+                log.warning("backend stream interrupted: %r (block_open=%s)", exc, block_open)
             if block_open:
                 # Stream ended (or errored) before any real token:
                 # close the block with the first-byte TTFT if available.
                 block_open = False
                 ttft = (first_byte_at - arrived_at) if first_byte_at is not None else None
+                log.info("block CLOSED at stream end, ttft=%s", ttft)
                 yield _reasoning_prefix(_route_close(ttft), None)
             if buf:
                 yield buf
